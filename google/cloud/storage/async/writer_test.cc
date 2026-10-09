@@ -296,6 +296,73 @@ TEST(AsyncWriterTest, ErrorWithMismatchedToken) {
   EXPECT_THAT(actual, StatusIs(StatusCode::kInvalidArgument));
 }
 
+/// @test Verify that `AsyncWriter` operations do not access member variables
+/// after a synchronous callback destroys the `AsyncWriter`.
+class AsyncWriterLifetimeTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    auto mock = std::make_unique<MockAsyncWriterConnection>();
+    mock_ = mock.get();
+    writer_ = std::make_unique<AsyncWriter>(std::move(mock));
+    // Keep an in-flight `Write()` whose continuation shares ownership of
+    // `mock_`, so destroying `writer_` inside a mock action does not destroy
+    // `mock_` while that action is still running.
+    EXPECT_CALL(*mock_, Write).WillOnce([this] {
+      return in_flight_write_promise_.get_future();
+    });
+    in_flight_write_ = writer_->Write(Token(), WritePayload{});
+  }
+
+  void TearDown() override {
+    in_flight_write_promise_.set_value(Status{});
+    EXPECT_STATUS_OK(in_flight_write_.get());
+  }
+
+  AsyncToken Token() { return storage_internal::MakeAsyncToken(mock_); }
+  void DestroyWriter() { writer_.reset(); }
+
+  MockAsyncWriterConnection* mock_ = nullptr;
+  std::unique_ptr<AsyncWriter> writer_;
+  promise<Status> in_flight_write_promise_;
+  future<StatusOr<AsyncToken>> in_flight_write_;
+};
+
+TEST_F(AsyncWriterLifetimeTest, WriteSurvivesWriterDestroyedByCallback) {
+  EXPECT_CALL(*mock_, Write).WillOnce([this] {
+    DestroyWriter();
+    return make_ready_future(Status{});
+  });
+  auto const actual = writer_->Write(Token(), WritePayload{}).get();
+  EXPECT_STATUS_OK(actual);
+}
+
+TEST_F(AsyncWriterLifetimeTest, FinalizeSurvivesWriterDestroyedByCallback) {
+  EXPECT_CALL(*mock_, Finalize).WillOnce([this] {
+    DestroyWriter();
+    return make_ready_future(make_status_or(google::storage::v2::Object{}));
+  });
+  auto const actual = writer_->Finalize(Token(), WritePayload{}).get();
+  EXPECT_STATUS_OK(actual);
+}
+
+TEST_F(AsyncWriterLifetimeTest, FlushSurvivesWriterDestroyedByCallback) {
+  EXPECT_CALL(*mock_, Flush).WillOnce([this] {
+    DestroyWriter();
+    return make_ready_future(Status{});
+  });
+  auto const actual = writer_->Flush().get();
+  EXPECT_STATUS_OK(actual);
+}
+
+TEST_F(AsyncWriterLifetimeTest, CloseSurvivesWriterDestroyedByCallback) {
+  EXPECT_CALL(*mock_, Close).WillOnce([this] {
+    DestroyWriter();
+    return make_ready_future(Status{});
+  });
+  auto const actual = writer_->Close().get();
+  EXPECT_STATUS_OK(actual);
+}
+
 }  // namespace
 GOOGLE_CLOUD_CPP_INLINE_NAMESPACE_END
 }  // namespace storage
