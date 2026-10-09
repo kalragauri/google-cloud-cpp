@@ -143,7 +143,8 @@ class AsyncWriterConnectionBufferedState
     finalize_ = true;
     // `HandleNewData()` may invoke a callback synchronously that destroys the
     // connection and `*this`, so move `finalized_future_` before calling it.
-    auto result = std::move(finalized_future_);
+    future<StatusOr<google::storage::v2::Object>> result =
+        std::move(finalized_future_);
     HandleNewData(std::move(lk), true);
     return result;
   }
@@ -163,7 +164,7 @@ class AsyncWriterConnectionBufferedState
     close_ = true;
     // `HandleNewData()` may invoke a callback synchronously that destroys the
     // connection and `*this`, so move `closed_future_` before calling it.
-    auto result = std::move(closed_future_);
+    future<Status> result = std::move(closed_future_);
     // Force flush to drain the buffer first.
     HandleNewData(std::move(lk), true);
     return result;

@@ -2689,38 +2689,55 @@ TEST(WriteConnectionBuffered,
               StatusIs(PermanentError().code()));
 }
 
-/// Terminal operations that end an upload.
-enum class TerminalOp { kFinalize, kClose };
+/// Operations that may start the write loop from the calling thread.
+enum class WriterOp { kWrite, kFlush, kFinalize, kClose };
 
-std::string TerminalOpName(TerminalOp op) {
-  return op == TerminalOp::kFinalize ? "Finalize" : "Close";
+std::string WriterOpName(WriterOp op) {
+  switch (op) {
+    case WriterOp::kWrite:
+      return "Write";
+    case WriterOp::kFlush:
+      return "Flush";
+    case WriterOp::kFinalize:
+      return "Finalize";
+    case WriterOp::kClose:
+      return "Close";
+  }
+  return "Unknown";
 }
 
 /// Starts @p op on @p connection and returns its completion as a `Status`.
-future<Status> StartTerminalOp(storage::AsyncWriterConnection& connection,
-                               TerminalOp op) {
-  if (op == TerminalOp::kFinalize) {
-    return connection.Finalize(storage::WritePayload{})
-        .then([](future<StatusOr<google::storage::v2::Object>> result) {
-          return result.get().status();
-        });
+future<Status> StartWriterOp(storage::AsyncWriterConnection& connection,
+                             WriterOp op) {
+  switch (op) {
+    case WriterOp::kWrite:
+      return connection.Write(storage::WritePayload{});
+    case WriterOp::kFlush:
+      return connection.Flush(storage::WritePayload{});
+    case WriterOp::kFinalize:
+      return connection.Finalize(storage::WritePayload{})
+          .then([](future<StatusOr<google::storage::v2::Object>> result) {
+            return result.get().status();
+          });
+    case WriterOp::kClose:
+      return connection.Close(storage::WritePayload{});
   }
-  return connection.Close(storage::WritePayload{});
+  return make_ready_future(
+      internal::UnknownError("unknown operation", GCP_ERROR_INFO()));
 }
 
-class WriterConnectionBufferedTerminalLifetimeTest
-    : public ::testing::TestWithParam<TerminalOp> {};
+class WriterConnectionBufferedLifetimeTest
+    : public ::testing::TestWithParam<WriterOp> {};
 
-/// @test Verify that `Finalize()` and `Close()` do not access the writer state
-/// after a synchronous callback destroys the connection.
+/// @test Verify that no operation accesses the writer state after a
+/// synchronous callback destroys the connection.
 ///
 /// A second thread is required because the write loop is idle with a pending
 /// future only while a `Flush()` callback is running, and that callback's
-/// continuation holds a reference to the writer state. Calling `Finalize()` or
-/// `Close()` from another thread while the `Flush()` callback is in flight lets
-/// the callback unwind and drop its reference before the terminal operation
-/// returns.
-TEST_P(WriterConnectionBufferedTerminalLifetimeTest,
+/// continuation holds a reference to the writer state. Calling the operation
+/// from another thread while the `Flush()` callback is in flight lets the
+/// callback unwind and drop its reference before the operation returns.
+TEST_P(WriterConnectionBufferedLifetimeTest,
        SurvivesConnectionDestroyedByCallback) {
   AsyncSequencer<bool> sequencer;
   auto persisted = std::make_shared<std::int64_t>(0);
@@ -2732,10 +2749,11 @@ TEST_P(WriterConnectionBufferedTerminalLifetimeTest,
   EXPECT_CALL(*mock, Flush)
       .WillOnce([&sequencer, persisted](storage::WritePayload const& payload) {
         auto const size = static_cast<std::int64_t>(payload.size());
-        return sequencer.PushBack("Flush").then([persisted, size](auto) {
-          *persisted += size;
-          return Status{};
-        });
+        return sequencer.PushBack("Flush").then(
+            [persisted, size](future<bool>) {
+              *persisted += size;
+              return Status{};
+            });
       })
       .WillOnce([](storage::WritePayload const&) {
         return make_ready_future(PermanentError());
@@ -2745,19 +2763,20 @@ TEST_P(WriterConnectionBufferedTerminalLifetimeTest,
 
   MockFactory mock_factory;
   EXPECT_CALL(mock_factory, Call).Times(0);
-  auto connection = MakeWriterConnectionBuffered(
-      mock_factory.AsStdFunction(), std::move(mock), TestOptions());
+  std::unique_ptr<storage::AsyncWriterConnection> connection =
+      MakeWriterConnectionBuffered(mock_factory.AsStdFunction(),
+                                   std::move(mock), TestOptions());
 
   // Refill the buffer to the high-water mark so `blocked_write` remains pending
   // after the first flush completes.
-  auto flush_future = connection->Flush(TestPayload(32 * 1024));
-  auto blocked_write = connection->Write(TestPayload(32 * 1024));
+  future<Status> flush_future = connection->Flush(TestPayload(32 * 1024));
+  future<Status> blocked_write = connection->Write(TestPayload(32 * 1024));
   ASSERT_FALSE(blocked_write.is_ready());
 
   promise<void> flush_callback_started;
   promise<void> unblock_flush_callback;
   promise<void> flush_callback_returned;
-  auto flush_done = flush_future.then([&](future<Status> result) {
+  future<void> flush_done = flush_future.then([&](future<Status> result) {
     EXPECT_STATUS_OK(result.get());
     flush_callback_started.set_value();
     unblock_flush_callback.get_future().wait();
@@ -2767,37 +2786,38 @@ TEST_P(WriterConnectionBufferedTerminalLifetimeTest,
   // flush's continuation so the terminal operation holds the last reference to
   // the writer state.
   Status write_status;
-  auto write_done = blocked_write.then([&](future<Status> result) {
+  future<void> write_done = blocked_write.then([&](future<Status> result) {
     write_status = result.get();
     connection.reset();
     unblock_flush_callback.set_value();
     flush_callback_returned.get_future().wait();
   });
 
-  auto next = sequencer.PopFrontWithName();
+  std::pair<promise<bool>, std::string> next = sequencer.PopFrontWithName();
   ASSERT_THAT(next.second, Eq("Flush"));
 
-  future<Status> terminal_future;
-  std::thread terminal_thread([&] {
+  future<Status> op_future;
+  std::thread op_thread([&] {
     flush_callback_started.get_future().wait();
-    terminal_future = StartTerminalOp(*connection, GetParam());
+    op_future = StartWriterOp(*connection, GetParam());
   });
   next.first.set_value(true);
   flush_callback_returned.set_value();
-  terminal_thread.join();
+  op_thread.join();
 
   ASSERT_TRUE(flush_done.is_ready());
   ASSERT_TRUE(write_done.is_ready());
   EXPECT_THAT(write_status, StatusIs(PermanentError().code()));
-  EXPECT_THAT(terminal_future.get(), StatusIs(PermanentError().code()));
+  EXPECT_THAT(op_future.get(), StatusIs(PermanentError().code()));
 }
 
 INSTANTIATE_TEST_SUITE_P(WriteConnectionBuffered,
-                         WriterConnectionBufferedTerminalLifetimeTest,
-                         ::testing::Values(TerminalOp::kFinalize,
-                                           TerminalOp::kClose),
-                         [](::testing::TestParamInfo<TerminalOp> const& info) {
-                           return TerminalOpName(info.param);
+                         WriterConnectionBufferedLifetimeTest,
+                         ::testing::Values(WriterOp::kWrite, WriterOp::kFlush,
+                                           WriterOp::kFinalize,
+                                           WriterOp::kClose),
+                         [](::testing::TestParamInfo<WriterOp> const& info) {
+                           return WriterOpName(info.param);
                          });
 
 }  // namespace
