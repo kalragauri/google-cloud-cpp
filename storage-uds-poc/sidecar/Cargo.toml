@@ -1,0 +1,43 @@
+[package]
+name        = "gcs-core-sidecar"
+version     = "0.1.0"
+edition     = "2024"
+publish     = false
+license     = "Apache-2.0"
+description = "POC: Rust core-sdk sidecar serving gcs.core.v0.StorageCore over a Unix domain socket"
+
+# Standalone package: never part of a parent workspace.
+[workspace]
+
+[[bin]]
+name = "gcs-core-sidecar"
+path = "src/main.rs"
+
+# "pure-rust" benchmark comparator: the same crate calls, in-process.
+[[bin]]
+name = "gcs-core-bench"
+path = "src/bin/gcs-core-bench.rs"
+
+[dependencies]
+bytes                = "1"
+futures              = "0.3"
+# Pinned to the release researched for the POC; the version is also reported
+# by GetVersion so every benchmark row records it.
+google-cloud-gax     = "1"
+google-cloud-storage = { version = "=1.21.0", features = ["default-rustls-provider"] }
+libc                 = "0.2"
+prost                = "0.14"
+tokio                = { version = "1", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream         = { version = "0.1", features = ["net"] }
+tonic                = { version = "0.14", default-features = false, features = ["codegen", "router", "server"] }
+tonic-prost          = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(google_cloud_unstable_storage_bidi)"] }
+
+[profile.release]
+# Keep line tables so perf / gdb can attribute CPU inside the core.
+debug = "line-tables-only"

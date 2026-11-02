@@ -1,0 +1,196 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Wire API between a thin language wrapper and the Rust `core-sdk` sidecar.
+//
+// The wrapper holds no storage logic: retries, resumable-upload state,
+// checksum validation and connection management all live in the sidecar,
+// which delegates to the `google-cloud-storage` crate. Messages are therefore
+// "what the caller asked for" (bucket, object, range, bytes), not GCS wire
+// protocol state. Handles appear only where the core keeps server-side state
+// (bidi read descriptors).
+syntax = "proto3";
+
+package gcs.core.v0;
+
+service StorageCore {
+  // Lifecycle and measurement.
+  rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse);
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
+
+  // Served by the core's JSON (HTTP/1.1) path.
+  rpc ReadObject(ReadObjectRequest) returns (stream ReadObjectResponse);
+  rpc WriteObject(stream WriteObjectRequest) returns (WriteObjectResponse);
+
+  // Served by the core's gRPC `StorageControl` client.
+  rpc ListObjects(ListObjectsRequest) returns (ListObjectsResponse);
+  rpc DeleteObject(DeleteObjectRequest) returns (DeleteObjectResponse);
+
+  // Served by the core's gRPC bidi path (BidiReadObject / BidiWriteObject).
+  rpc OpenObject(OpenObjectRequest) returns (OpenObjectResponse);
+  rpc ReadRanges(ReadRangesRequest) returns (stream ReadRangesResponse);
+  rpc CloseObject(CloseObjectRequest) returns (CloseObjectResponse);
+  rpc AppendableWrite(stream AppendableWriteRequest)
+      returns (AppendableWriteResponse);
+}
+
+message ObjectMetadata {
+  string bucket = 1;
+  string name = 2;
+  int64 generation = 3;
+  int64 metageneration = 4;
+  uint64 size = 5;
+  string content_type = 6;
+  optional fixed32 crc32c = 7;
+  bytes md5_hash = 8;
+  string etag = 9;
+  string storage_class = 10;
+}
+
+message GetVersionRequest {}
+message GetVersionResponse {
+  string sidecar_version = 1;
+  string storage_crate_version = 2;
+  uint32 pid = 3;
+  bool bidi_enabled = 4;
+  bool synthetic = 5;
+}
+
+// Process-level counters of the sidecar. Callers diff two snapshots taken
+// outside the timed window, the same way they diff their own getrusage().
+message GetStatsRequest {}
+message GetStatsResponse {
+  uint64 user_cpu_us = 1;
+  uint64 system_cpu_us = 2;
+  uint64 rss_bytes = 3;
+  uint64 peak_rss_bytes = 4;
+  // Cumulative bytes requested from the global allocator (never decremented).
+  uint64 allocated_bytes = 5;
+  uint32 threads = 6;
+}
+
+message ShutdownRequest {}
+message ShutdownResponse {}
+
+// `limit == 0` means "to the end of the object". A negative `offset` reads
+// the last `-offset` bytes and requires `limit == 0`.
+message ReadRange {
+  int64 offset = 1;
+  int64 limit = 2;
+}
+
+message ReadObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+  ReadRange range = 4;
+  // Upper bound for the size of each `data` message. 0 selects the default.
+  uint32 chunk_size_hint = 5;
+}
+
+// Only the first message carries `metadata`; `data` may be empty in it.
+// `data` is deliberately not inside a oneof: `ctype = CORD` is honored on
+// plain singular bytes fields (the shape of `google.storage.v2.ChecksummedData`).
+message ReadObjectResponse {
+  ObjectMetadata metadata = 1;
+  bytes data = 2 [ctype = CORD];
+}
+
+message WriteSpec {
+  enum UploadMode {
+    // Let the core choose (single-shot below its resumable threshold).
+    UPLOAD_MODE_AUTO = 0;
+    UPLOAD_MODE_SINGLE_SHOT = 1;
+    UPLOAD_MODE_RESUMABLE = 2;
+  }
+  string bucket = 1;
+  string object = 2;
+  // Total size if known, used by the core to pick the upload mode.
+  optional uint64 size_hint = 3;
+  string content_type = 4;
+  optional int64 if_generation_match = 5;
+  UploadMode upload_mode = 6;
+}
+
+// Only the first message carries `spec`; `data` may be empty in it.
+// Closing the request stream finalizes the object.
+message WriteObjectRequest {
+  WriteSpec spec = 1;
+  bytes data = 2 [ctype = CORD];
+}
+message WriteObjectResponse {
+  ObjectMetadata metadata = 1;
+}
+
+message ListObjectsRequest {
+  string bucket = 1;
+  string prefix = 2;
+  string delimiter = 3;
+  int32 page_size = 4;
+  string page_token = 5;
+}
+message ListObjectsResponse {
+  repeated ObjectMetadata objects = 1;
+  repeated string prefixes = 2;
+  string next_page_token = 3;
+}
+
+message DeleteObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+}
+message DeleteObjectResponse {}
+
+message OpenObjectRequest {
+  string bucket = 1;
+  string object = 2;
+  int64 generation = 3;
+}
+message OpenObjectResponse {
+  uint64 handle = 1;
+  ObjectMetadata metadata = 2;
+}
+
+// All ranges are read concurrently by the core over the descriptor's single
+// BidiReadObject stream. Chunks of different ranges may interleave.
+message ReadRangesRequest {
+  uint64 handle = 1;
+  repeated ReadRange ranges = 2;
+  uint32 chunk_size_hint = 3;
+}
+message ReadRangesResponse {
+  uint32 range_index = 1;
+  bytes data = 2 [ctype = CORD];
+}
+
+message CloseObjectRequest {
+  uint64 handle = 1;
+}
+message CloseObjectResponse {}
+
+// Appendable (zonal bucket) upload. Only the first message carries `spec`.
+// Setting `finalize` on the last message finalizes the object; closing the
+// stream without it leaves the object appendable.
+message AppendableWriteRequest {
+  WriteSpec spec = 1;
+  bytes data = 2 [ctype = CORD];
+  bool finalize = 3;
+}
+message AppendableWriteResponse {
+  int64 persisted_size = 1;
+  // Set when the object was finalized.
+  ObjectMetadata metadata = 2;
+}

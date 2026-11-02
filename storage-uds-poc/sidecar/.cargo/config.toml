@@ -1,0 +1,5 @@
+# The appendable-object (BidiWriteObject) API of google-cloud-storage 1.x is
+# gated behind this rustc cfg, not a Cargo feature. It must be set for the
+# whole build, so it lives here rather than in Cargo.toml.
+[build]
+rustflags = ["--cfg", "google_cloud_unstable_storage_bidi"]
