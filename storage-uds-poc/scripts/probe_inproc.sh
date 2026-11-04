@@ -13,132 +13,249 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# VM job: packaging and lifecycle probes for both boundaries, measured the
-# same way (plan §6.4): stripped binary sizes, one-file rebuild times, and the
-# cold start of `Client::Create()` in a fresh process with the footprint right
-# after. Output goes to stdout (the job runner uploads the log).
-#
-# It rebuilds the benchmark binaries: run it only as its own job, never while
-# vm_run.sh is measuring (the job runner executes jobs one at a time).
-#   OPS   ops bucket; results are also copied to gs://$OPS/results/$RUN/
+# VM job: packaging, build-time, cold-start, and customer-environment deployment
+# probes for plan rev 4 §12 (Challenges table rows 2, 3, 5, 7):
+#   1. Raw & stripped binary and archive sizes + shared-library (`ldd`) diff.
+#   2. Incremental one-file rebuild wall times (C++ TU, Rust `service.rs`,
+#      `gcscore.proto`).
+#   3. Cold `Client::Create()` latency (n=30) and `VmRSS`/`VmHWM`/`Threads`
+#      footprint across daemon, child (`--child`), and in-process modes.
+#   4. Customer-environment deployment probes: `noexec` tmpfs, read-only
+#      filesystem (filesystem UDS vs `XDG_RUNTIME_DIR` vs `unix-abstract:`
+#      in-process), container PID-1 namespace (`unshare --pid`), >107-byte
+#      socket path (B8), stale socket / regular file (B7), parent `SIGKILL`
+#      orphan cleanup (B4), and cross-UID `SO_PEERCRED` rejection (B9).
 set -uo pipefail
+
 export PATH="$HOME/.cargo/bin:$PATH"
-OPS="${OPS:-kalragauri-uds-poc-ops}"
-POC="$HOME/poc/src/storage-uds-poc"
-BUILD="$POC/cmake-out"
-RUN="${RUN:-inproc-probes-$(date -u +%Y%m%dT%H%M%SZ)}"
-OUT="$HOME/poc/results/$RUN"
+OPS="${OPS:-}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+POC="${POC:-$(dirname "$SCRIPT_DIR")}"
+BUILD="${BUILD:-$POC/cmake-out}"
+RUN="${RUN:-packaging-probes-$(date -u +%Y%m%dT%H%M%SZ)}"
+OUT="${OUT:-$HOME/poc/results/$RUN}"
 mkdir -p "$OUT"
+
+RUST_DIR="$HOME/poc/rust"
+[[ ! -d "$RUST_DIR" ]] && RUST_DIR="$BUILD/_deps/google_cloud_rust-src"
 export PROTOC="$BUILD/vcpkg_installed/x64-linux/tools/protobuf/protoc"
-export GCS_CORE_SIDECAR="$POC/sidecar/target/release/gcs-core-sidecar"
+export GCS_CORE_SERVER="$BUILD/gcs-core-server"
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+cleanup() {
+  sudo -n umount "$TMP/noexec" 2>/dev/null || true
+  sudo -n umount "$TMP/ro_mnt" 2>/dev/null || true
+  pkill -x gcs-core-server 2>/dev/null || true
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 
 echo "=== 1. Binary and archive sizes (bytes; stripped = strip -s) ==="
-for f in "$POC/sidecar/target/release/gcs-core-sidecar" "$POC/sidecar/target/release/gcs-core-bench" \
-         "$BUILD/bench/ssb_uds" "$BUILD/bench/ssb_inproc" "$BUILD/bench/ssb_native" \
-         "$BUILD/quickstart" "$BUILD/quickstart_inproc" "$BUILD/cold_start" "$BUILD/cold_start_inproc"; do
+for f in "$BUILD/gcs-core-server" \
+         "$BUILD/quickstart" "$BUILD/quickstart_inproc" \
+         "$BUILD/cold_start" "$BUILD/cold_start_inproc" \
+         "$BUILD/bench/uds_poc_bench"; do
+  [[ -f "$f" ]] || continue
   name="$(basename "$f")"
   raw="$(stat -c '%s' "$f")"
   cp "$f" "$TMP/$name" && strip -s "$TMP/$name"
   stripped="$(stat -c '%s' "$TMP/$name")"
-  printf "%-22s raw=%12d (%7.2f MiB)  stripped=%12d (%7.2f MiB)\n" "$name" "$raw" \
-    "$(awk "BEGIN{print $raw/1048576}")" "$stripped" "$(awk "BEGIN{print $stripped/1048576}")"
+  printf "%-22s raw=%12d (%7.2f MiB)  stripped=%12d (%7.2f MiB)\n" \
+    "$name" "$raw" "$(awk "BEGIN{print $raw/1048576}")" \
+    "$stripped" "$(awk "BEGIN{print $stripped/1048576}")"
 done
-for lib in "$POC/sidecar/target/release/libgcs_core.a" "$BUILD/libgcs_core.a" "$BUILD/libgcs_core_inproc.a" "$BUILD/libgcs_core_protos.a"; do
+
+for lib in "$BUILD/cargo-target/release/libstorage_grpc_uds.a" \
+           "$BUILD/libgcs_core.a" "$BUILD/libgcs_core_inproc.a" \
+           "$BUILD/libgcs_core_storage.a" "$BUILD/libgcs_core_storage_inproc.a" \
+           "$BUILD/libgcs_core_protos.a"; do
   [[ -f "$lib" ]] || continue
   raw="$(stat -c '%s' "$lib")"
-  printf "%-22s raw=%12d (%7.2f MiB)\n" "$(basename "$lib")" "$raw" "$(awk "BEGIN{print $raw/1048576}")"
+  printf "%-30s raw=%12d (%7.2f MiB)\n" \
+    "$(basename "$lib")" "$raw" "$(awk "BEGIN{print $raw/1048576}")"
 done
-echo "--- ldd ssb_inproc (the in-process binary must not need anything the uds one does not) ---"
-diff <(ldd "$BUILD/bench/ssb_uds" | awk '{print $1}' | sort) <(ldd "$BUILD/bench/ssb_inproc" | awk '{print $1}' | sort) && echo "same shared libraries"
+
+echo "--- ldd diff: quickstart vs quickstart_inproc ---"
+diff <(ldd "$BUILD/quickstart" | awk '{print $1}' | sort) \
+     <(ldd "$BUILD/quickstart_inproc" | awk '{print $1}' | sort) \
+  && echo "same shared libraries"
 
 echo ""
-echo "=== 2. One-file rebuild times (1-line comment touch; cpus=$(nproc)) ==="
-measure() { # measure LABEL CMD... : wall seconds of CMD
-  local label=$1; shift
-  local t0 t1; t0=$(date +%s.%N); "$@" >/dev/null 2>&1; t1=$(date +%s.%N)
+echo "=== 2. Cold Client::Create() in a fresh process (n=30) & footprint ==="
+pkill -x gcs-core-server 2>/dev/null || true
+python3 - "$BUILD/cold_start" "$BUILD/cold_start_inproc" "$TMP" <<'PY'
+import os
+import subprocess
+import sys
+
+cold_sidecar, cold_inproc, tmp = sys.argv[1], sys.argv[2], sys.argv[3]
+base_args = [
+    "--sidecar-arg=--endpoint=http://127.0.0.1:1",
+    "--sidecar-arg=--shm-size=0",
+    "--sidecar-arg=--grpc-subchannels=4",
+]
+configs = [
+    ("sidecar-child-default", cold_sidecar, ["--child", "--channels=4", *base_args]),
+    ("sidecar-child-wt8", cold_sidecar, ["--child", "--channels=4", *base_args, "--sidecar-arg=--worker-threads=8"]),
+    ("sidecar-daemon-warm", cold_sidecar, [f"--socket-path={tmp}/warm-daemon.sock", "--channels=4", *base_args]),
+    ("inproc-default", cold_inproc, ["--channels=4", *base_args]),
+    ("inproc-wt8", cold_inproc, ["--channels=4", *base_args, "--sidecar-arg=--worker-threads=8"]),
+]
+
+for label, binary, args in configs:
+    if label == "sidecar-daemon-warm":
+        # Prime the daemon once so the 30 samples measure warm attach latency;
+        # cold spawn is already measured by sidecar-child-*.
+        subprocess.run([binary, *args], capture_output=True, text=True, check=True)
+    times, footprint = [], None
+    for i in range(30):
+        p = subprocess.run([binary, *args], capture_output=True, text=True, timeout=60)
+        if p.returncode != 0:
+            print(f"[{label}] iter {i} failed: {p.stderr.strip()[:200]}")
+            break
+        lines = p.stdout.splitlines()
+        times.append(float(lines[0].split("=", 1)[1]))
+        if footprint is None:
+            footprint = " | ".join(line.strip() for line in lines[1:])
+    if not times:
+        continue
+    times.sort()
+    q = lambda f: times[min(len(times) - 1, int(f * (len(times) - 1) + 0.5))]
+    print(
+        f"[{label}] create_ms: n={len(times)} min={times[0]:.2f} p50={q(0.5):.2f} "
+        f"p90={q(0.9):.2f} p99={q(0.99):.2f} max={times[-1]:.2f}"
+    )
+    print(f"[{label}] {footprint}")
+PY
+pkill -x gcs-core-server 2>/dev/null || true
+
+echo ""
+echo "=== 3. Deployment environment probes ==="
+HERMETIC_ARGS=(
+  --sidecar-arg=--endpoint=http://127.0.0.1:1
+  --sidecar-arg=--shm-size=0
+  --sidecar-arg=--grpc-subchannels=1
+  --sidecar-arg=--worker-threads=2
+)
+
+echo "--- 3a. UDS path > 107 bytes (row B8) ---"
+LONG_SOCK="$TMP/$(python3 - <<'PY'
+print("a" * 115 + ".sock")
+PY
+)"
+if "$BUILD/cold_start" --child --socket-path="$LONG_SOCK" "${HERMETIC_ARGS[@]}" 2>"$TMP/long.err"; then
+  echo "FAIL: >107B socket unexpectedly succeeded"
+else
+  echo "PASS (>107B rejected): $(cat "$TMP/long.err")"
+fi
+
+echo "--- 3b. Stale socket & regular non-socket file at socket path (row B7) ---"
+python3 - "$TMP/stale.sock" <<'PY'
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sys.argv[1])
+s.close()
+PY
+"$BUILD/cold_start" --child --socket-path="$TMP/stale.sock" "${HERMETIC_ARGS[@]}" >/dev/null \
+  && echo "PASS: stale socket unlinked and replaced cleanly"
+echo "not-a-socket" >"$TMP/regular.file"
+if "$BUILD/cold_start" --child --socket-path="$TMP/regular.file" "${HERMETIC_ARGS[@]}" 2>"$TMP/reg.err"; then
+  echo "FAIL: regular file unexpectedly overwritten"
+else
+  echo "PASS (regular file preserved): $(head -n 1 "$TMP/reg.err")"
+fi
+
+echo "--- 3c. Parent SIGKILL orphan cleanup (row B4) & SO_PEERCRED (row B9) ---"
+bash "$POC/scripts/test_parent_crash.sh"
+bash "$POC/scripts/test_peer_cred.sh"
+
+if sudo -n true 2>/dev/null; then
+  echo "--- 3d. noexec /tmp mount probe ---"
+  mkdir -p "$TMP/noexec"
+  sudo -n mount -t tmpfs -o size=64m,noexec,mode=1777 tmpfs "$TMP/noexec"
+  cp "$BUILD/gcs-core-server" "$TMP/noexec/gcs-core-server"
+  chmod 0755 "$TMP/noexec/gcs-core-server"
+  if GCS_CORE_SERVER="$TMP/noexec/gcs-core-server" \
+      "$BUILD/cold_start" --child --socket-path="$TMP/noexec/fail.sock" "${HERMETIC_ARGS[@]}" 2>"$TMP/noexec.err"; then
+    echo "FAIL: binary on noexec tmpfs unexpectedly executed"
+  else
+    echo "PASS (binary on noexec rejected): $(head -n 1 "$TMP/noexec.err")"
+  fi
+  "$BUILD/cold_start" --child --socket-path="$TMP/noexec/ok.sock" "${HERMETIC_ARGS[@]}" >/dev/null \
+    && echo "PASS: socket on noexec tmpfs works when binary is on exec mount"
+  sudo -n umount "$TMP/noexec"
+
+  echo "--- 3e. Read-only filesystem probe (sidecar vs unix-abstract inproc) ---"
+  mkdir -p "$TMP/ro_src" "$TMP/ro_mnt"
+  chmod 0777 "$TMP/ro_src"
+  sudo -n mount --bind "$TMP/ro_src" "$TMP/ro_mnt"
+  sudo -n mount -o remount,ro,bind "$TMP/ro_mnt"
+  if "$BUILD/cold_start" --child --socket-path="$TMP/ro_mnt/ro.sock" "${HERMETIC_ARGS[@]}" 2>"$TMP/ro.err"; then
+    echo "FAIL: filesystem socket on read-only mount unexpectedly succeeded"
+  else
+    echo "PASS (sidecar on RO FS without writable runtime dir fails cleanly): $(head -n 1 "$TMP/ro.err")"
+  fi
+  XDG_RUNTIME_DIR="$TMP/ro_mnt" "$BUILD/cold_start_inproc" "${HERMETIC_ARGS[@]}" >/dev/null \
+    && echo "PASS: in-process variant (unix-abstract:) succeeds with read-only XDG_RUNTIME_DIR"
+  sudo -n umount "$TMP/ro_mnt"
+
+  echo "--- 3f. Container PID-1 namespace probe (unshare --pid --fork) ---"
+  sudo -n unshare --pid --fork --mount-proc \
+    su - "$(id -un)" -c "GCS_CORE_SERVER='$BUILD/gcs-core-server' '$BUILD/cold_start' --child --socket-path='$TMP/pid1.sock' ${HERMETIC_ARGS[*]}" \
+    | head -n 2 && echo "PASS: child sidecar works inside PID namespace"
+else
+  echo "SKIP 3d-3f: passwordless sudo unavailable on this host"
+fi
+
+echo ""
+echo "=== 4. Incremental 1-file rebuild times (cpus=$(nproc)) ==="
+measure() {
+  local label=$1
+  shift
+  local t0 t1
+  t0=$(date +%s.%N)
+  "$@" >/dev/null 2>&1
+  t1=$(date +%s.%N)
   awk "BEGIN{printf \"%s=%.3f s\n\", \"$label\", $t1 - $t0}"
 }
-touch_probe() { # touch_probe FILE : appends a comment line, restores on return via RESTORE
-  cp "$1" "$TMP/$(basename "$1").bak"; echo "// incremental build probe" >> "$1"
+touch_probe() {
+  cp "$1" "$TMP/$(basename "$1").bak"
+  echo "// incremental build probe" >>"$1"
 }
-restore() { mv "$TMP/$(basename "$1").bak" "$1"; }
-cmake --build "$BUILD" -j"$(nproc)" --target ssb_uds ssb_inproc >/dev/null 2>&1
+restore_probe() {
+  mv "$TMP/$(basename "$1").bak" "$1"
+}
+
+cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
 
 touch_probe "$POC/cpp/src/client.cc"
-measure "cpp_client_cc_to_ssb_uds" cmake --build "$BUILD" -j"$(nproc)" --target ssb_uds
-measure "cpp_client_cc_to_ssb_inproc" cmake --build "$BUILD" -j"$(nproc)" --target ssb_inproc
-restore "$POC/cpp/src/client.cc"
-cmake --build "$BUILD" -j"$(nproc)" --target ssb_uds ssb_inproc >/dev/null 2>&1
+measure "cpp_client_cc_to_quickstart_sidecar" cmake --build "$BUILD" -j"$(nproc)" --target quickstart
+restore_probe "$POC/cpp/src/client.cc"
+cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
 
-# Each Rust-side measurement starts from a fully built tree with one file
-# touched, so neither variant reuses compilation the other just did (the lib
-# target builds rlib and staticlib together; measuring one variant right after
-# the other would time little more than a link).
-rebuild_all() {
-  (cd "$POC/sidecar" && cargo build --release >/dev/null 2>&1)
-  cmake --build "$BUILD" -j"$(nproc)" --target ssb_uds ssb_inproc >/dev/null 2>&1
-}
-for variant in sidecar inproc; do
-  touch_probe "$POC/sidecar/src/service.rs"
-  if [[ $variant == sidecar ]]; then
-    measure "rust_service_rs_to_sidecar_binary" bash -c "cd '$POC/sidecar' && cargo build --release --bin gcs-core-sidecar"
-  else
-    measure "rust_service_rs_to_ssb_inproc" cmake --build "$BUILD" -j"$(nproc)" --target ssb_inproc
-  fi
-  restore "$POC/sidecar/src/service.rs"
-  rebuild_all
-done
-for variant in sidecar inproc; do
-  touch_probe "$POC/proto/gcs/core/v0/storage_core.proto"
-  if [[ $variant == sidecar ]]; then
-    measure "proto_to_ssb_uds_and_sidecar" bash -c "cmake --build '$BUILD' -j$(nproc) --target ssb_uds && cd '$POC/sidecar' && cargo build --release --bin gcs-core-sidecar"
-  else
-    measure "proto_to_ssb_inproc" cmake --build "$BUILD" -j"$(nproc)" --target ssb_inproc
-  fi
-  restore "$POC/proto/gcs/core/v0/storage_core.proto"
-  rebuild_all
-done
+touch_probe "$POC/cpp/src/client.cc"
+measure "cpp_client_cc_to_quickstart_inproc" cmake --build "$BUILD" -j"$(nproc)" --target quickstart_inproc
+restore_probe "$POC/cpp/src/client.cc"
+cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
 
-echo ""
-echo "=== 3. Cold Client::Create() in a fresh process, n=30 per row, and footprint after ==="
-python3 - "$BUILD/cold_start" "$BUILD/cold_start_inproc" << 'PY'
-import subprocess, sys, statistics
-uds, inproc = sys.argv[1], sys.argv[2]
-CONFIGS = [
-    ("synthetic-default", ["--sidecar-arg=--synthetic"]),
-    ("synthetic-wt8", ["--sidecar-arg=--synthetic", "--sidecar-arg=--worker-threads=8"]),
-    ("cloudpath-ch4-default", ["--sidecar-arg=--grpc-subchannels=4"]),
-    ("cloudpath-ch4-wt8", ["--sidecar-arg=--grpc-subchannels=4", "--sidecar-arg=--worker-threads=8"]),
-]
-for variant, binary in (("uds", uds), ("inproc", inproc)):
-    for label, args in CONFIGS:
-        times, footprint = [], None
-        for i in range(30):
-            p = subprocess.run([binary, *args], capture_output=True, text=True, timeout=60)
-            if p.returncode != 0:
-                print(f"[{variant}/{label}] iteration {i} failed: {p.stderr.strip()[:200]}")
-                break
-            lines = p.stdout.splitlines()
-            times.append(float(lines[0].split("=", 1)[1]))
-            if footprint is None:
-                footprint = " | ".join(l.strip() for l in lines[1:])
-        if not times:
-            continue
-        times.sort()
-        q = lambda f: times[min(len(times) - 1, int(f * (len(times) - 1) + 0.5))]
-        print(f"[{variant}/{label}] create_ms: n={len(times)} min={times[0]:.2f} p50={q(0.5):.2f} "
-              f"p90={q(0.9):.2f} p99={q(0.99):.2f} max={times[-1]:.2f}")
-        print(f"[{variant}/{label}] {footprint}")
-PY
+if [[ -f "$RUST_DIR/src/storage/grpc-uds/src/service.rs" ]]; then
+  touch_probe "$RUST_DIR/src/storage/grpc-uds/src/service.rs"
+  measure "rust_service_rs_to_quickstart_sidecar" cmake --build "$BUILD" -j"$(nproc)" --target gcs_core_rust quickstart
+  restore_probe "$RUST_DIR/src/storage/grpc-uds/src/service.rs"
+  cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
 
-echo ""
-echo "=== 4. Unit tests on the VM ==="
-(cd "$POC/sidecar" && cargo test --release 2>&1 | grep -E "^test result|FAILED") || true
-"$BUILD/gcs_core_test" 2>&1 | tail -3
-"$BUILD/gcs_core_inproc_test" 2>&1 | tail -3
+  touch_probe "$RUST_DIR/src/storage/grpc-uds/src/service.rs"
+  measure "rust_service_rs_to_quickstart_inproc" cmake --build "$BUILD" -j"$(nproc)" --target quickstart_inproc
+  restore_probe "$RUST_DIR/src/storage/grpc-uds/src/service.rs"
+  cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
 
-echo "RUN=$RUN"
-gcloud storage cp --quiet "$OUT"/* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  touch_probe "$RUST_DIR/src/storage/grpc-uds/proto/gcscore.proto"
+  measure "proto_gcscore_to_quickstart_sidecar_and_inproc" cmake --build "$BUILD" -j"$(nproc)" --target gcs_core_rust quickstart quickstart_inproc
+  restore_probe "$RUST_DIR/src/storage/grpc-uds/proto/gcscore.proto"
+  cmake --build "$BUILD" -j"$(nproc)" --target quickstart quickstart_inproc >/dev/null 2>&1
+fi
+
+echo "PROBES_DONE run=$RUN"
+if [[ -n "$OPS" ]]; then
+  gcloud storage cp --quiet "$OUT"/* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+fi

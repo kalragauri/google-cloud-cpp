@@ -13,18 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GCE startup script for the benchmark VM: installs a systemd service that
-# runs job scripts dropped into gs://$OPS/jobs/ and uploads their logs.
-#
-# Used because the benchmark project accepts no inbound SSH from the
-# development workstation; the VM only makes outbound calls to GCS.
-#
-#   submit: gcloud storage cp job.sh gs://$OPS/jobs/<name>.sh
-#   result: gs://$OPS/results/<name>.log  (+ <name>.exit when finished)
-#
-# Jobs run one at a time, in name order, as the unprivileged user `poc`
-# (with passwordless sudo for package installation). Only principals that
-# can write to the ops bucket can submit jobs.
+# GCE startup script for the benchmark VM (plan rev 4 §11):
+#   1. Installs and verifies Google Cloud Ops Agent so
+#      `agent.googleapis.com/memory/percent_used{state=used}` is exported (D2/D3).
+#   2. Installs `poc-runner.service` polling `gs://$OPS/jobs/*.sh` and uploading
+#      live logs and `.exit` codes to `gs://$OPS/results/`.
 set -euo pipefail
 
 MDS="http://169.254.169.254/computeMetadata/v1"
@@ -38,8 +31,19 @@ done
 OPS="$(curl -fsS -H Metadata-Flavor:Google "$MDS/instance/attributes/ops-bucket")"
 SA_EMAIL="$(curl -fsS -H Metadata-Flavor:Google "$MDS/instance/service-accounts/default/email")"
 
+# Install Google Cloud Ops Agent if not already active (plan rev 4 §8 row D3).
+if ! systemctl is-active --quiet google-cloud-ops-agent; then
+  TMP_OPS="$(mktemp -d)"
+  curl -sS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \
+    -o "$TMP_OPS/add-google-cloud-ops-agent-repo.sh"
+  bash "$TMP_OPS/add-google-cloud-ops-agent-repo.sh" --also-install
+  rm -rf "$TMP_OPS"
+  systemctl enable --now google-cloud-ops-agent
+fi
+
 id poc >/dev/null 2>&1 || useradd --create-home --shell /bin/bash poc
 echo 'poc ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/poc
+chmod 0440 /etc/sudoers.d/poc
 
 rm -f /home/poc/.config/gcloud/gce
 su - poc -c "GCE_METADATA_HOST=169.254.169.254 GCE_METADATA_ROOT=169.254.169.254 gcloud config set account '$SA_EMAIL' >/dev/null 2>&1 || true"
@@ -64,13 +68,12 @@ while true; do
     gcloud storage cp --quiet "$url" "$HOME/jobs/$name.sh" || continue
     echo "$name" >>"$DONE"
     log="$HOME/jobs/$name.log"
-    # Upload the log every 30 s while the job runs, so progress is visible.
     ( while sleep 30; do
         gcloud storage cp --quiet "$log" "gs://$OPS/results/$name.log" >/dev/null 2>&1
       done ) & uploader=$!
     ( cd "$HOME" && OPS="$OPS" bash "$HOME/jobs/$name.sh" ) >"$log" 2>&1
     rc=$?
-    kill "$uploader" 2>/dev/null
+    kill "$uploader" 2>/dev/null || true
     gcloud storage cp --quiet "$log" "gs://$OPS/results/$name.log"
     echo "$rc" | gcloud storage cp --quiet - "gs://$OPS/results/$name.exit"
   done
@@ -97,4 +100,4 @@ EOF
 systemctl daemon-reload
 systemctl enable poc-runner.service
 systemctl restart poc-runner.service
-echo "poc-runner restarted; ops bucket gs://${OPS} account=${SA_EMAIL}"
+echo "poc-runner restarted; ops bucket gs://${OPS} account=${SA_EMAIL} ops_agent=$(systemctl is-active google-cloud-ops-agent)"

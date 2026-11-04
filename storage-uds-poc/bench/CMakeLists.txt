@@ -12,20 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Three binaries sharing one workload definition. Each links only what it
-# measures, so no process carries another variant's libraries or threads:
-# `ssb_uds` has no Rust code, `ssb_inproc` has no sidecar spawner.
-add_executable(ssb_uds alloc_counter.cc ssb_uds.cc)
-target_link_libraries(ssb_uds PRIVATE gcs_core)
-gcs_uds_poc_warnings(ssb_uds)
-
-if (GCS_UDS_POC_BUILD_INPROC)
-    add_executable(ssb_inproc alloc_counter.cc ssb_inproc.cc)
-    target_link_libraries(ssb_inproc PRIVATE gcs_core_inproc)
-    gcs_uds_poc_warnings(ssb_inproc)
-endif ()
-
-add_executable(ssb_native alloc_counter.cc ssb_native.cc)
-target_link_libraries(ssb_native PRIVATE absl::strings
-                                         google-cloud-cpp::storage_grpc)
-gcs_uds_poc_warnings(ssb_native)
+# Single unified benchmark binary (`uds_poc_bench`) driving all three
+# comparators (`--mode=native`, `--mode=uds-sidecar`, `--mode=uds-inproc`)
+# through identical public `google::cloud::storage::Client` and
+# `google::cloud::storage::AsyncClient` workload loops.
+add_executable(uds_poc_bench uds_poc_bench.cc)
+target_link_libraries(
+    uds_poc_bench
+    PRIVATE absl::cord absl::strings gcs_core_storage_combined
+            google-cloud-cpp::storage google-cloud-cpp::storage_grpc)
+gcs_uds_poc_warnings(uds_poc_bench)

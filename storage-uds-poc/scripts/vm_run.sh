@@ -13,205 +13,218 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# VM job: runs the benchmark matrix (plan §7.2) and uploads every CSV, log
-# and path report to gs://$OPS/results/$RUN/.
+# VM job: runs S0 probes or the S4 benchmark matrix (plan rev 4 §6-§8) and
+# uploads every CSV, summary JSON, Cloud Monitoring JSON, path report, and log
+# to gs://$OPS/results/$RUN/.
 #
-#   PHASE=smoke       2 iterations of every cell, default flags first
-#   PHASE=full        the measured matrix
-#   PHASE=supplement  supplementary Cloudpath pass (uds-ch4, inproc-ch4,
-#                     pure-rust-unbuffered, pure-upload THROUGHPUT-WRITE)
-#   ITER              iterations per cell in full/supplement (default 200)
+#   PHASE=probes  S0 probes (quickstart on regional & zonal + Monitoring check)
+#   PHASE=smoke   short-duration smoke run of every workload x comparator
+#   PHASE=full    prescribed >=3 min / 5 min measured matrix
 #
-# Rules enforced here: implementations run one at a time, in rotating order
-# per cell; every run goes through verify_path.py (Cloudpath only); the
-# sidecar, the in-process core and the pure-Rust core all use 4 gRPC
-# subchannels, like native. `inproc` (core on threads of the benchmark
-# process) runs next to `uds` (core in a sidecar process) in every cell with
-# the same core arguments, so the pair isolates the process boundary.
+# Enforces plan §7.1 comparison rules:
+#   * Ops Agent active before starting (row D3).
+#   * One comparator running at a time; lingering daemons stopped between cells
+#     so idle server RSS never leaks into another comparator's VM memory window.
+#   * Rotating comparator order across workloads (`native`, `uds-sidecar`,
+#     `uds-inproc`, row C8).
+#   * `verify_path.py` gates every cell (Cloudpath only, row C1).
+#   * `monitoring.py` queries Cloud Monitoring CPU and Ops Agent memory per
+#     workload window (rows D1/D2).
 set -uo pipefail
-OPS="${OPS:-kalragauri-uds-poc-ops}"
+
+OPS="${OPS:?OPS bucket must be set}"
 PHASE="${PHASE:-smoke}"
-ITER="${ITER:-200}"
-REGIONAL="${REGIONAL:-kalragauri-uds-poc-regional}"
-ZONAL="${ZONAL:-kalragauri-uds-poc-zonal}"
-POC="$HOME/poc/src/storage-uds-poc"
+REGIONAL="${REGIONAL:?REGIONAL bucket must be set}"
+ZONAL="${ZONAL:?ZONAL bucket must be set}"
+BUCKET_PREFIX="${BUCKET_PREFIX:?BUCKET_PREFIX must be set}"
+ALLOW_REGIONAL_BIDI="${ALLOW_REGIONAL_BIDI:-0}"
+POC="${POC:-$HOME/poc/src/storage-uds-poc}"
+BUILD="$POC/cmake-out"
 RUN="${RUN:-$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="$HOME/poc/results/$RUN"
 mkdir -p "$OUT"
 cd "$OUT"
 
-export GCS_CORE_SIDECAR="$POC/sidecar/target/release/gcs-core-sidecar"
-UDS="$POC/cmake-out/bench/ssb_uds"
-INPROC="$POC/cmake-out/bench/ssb_inproc"
-NATIVE="$POC/cmake-out/bench/ssb_native"
-RUST="$POC/sidecar/target/release/gcs-core-bench"
-# Scripts can be updated without rebuilding: fetch the current copies.
-gcloud storage cp --quiet "gs://$OPS/scripts/verify_path.py" "$POC/scripts/verify_path.py" >/dev/null 2>&1 || true
+export GCS_CORE_SERVER="$BUILD/gcs-core-server"
+BENCH="$BUILD/bench/uds_poc_bench"
 VERIFY="$POC/scripts/verify_path.py"
-SIDECAR_ARGS=(--sidecar-arg=--grpc-subchannels=4)
+MON="$POC/scripts/monitoring.py"
 
-md() { curl -fsS -H Metadata-Flavor:Google "http://metadata/computeMetadata/v1/instance/$1" | awk -F/ '{print $NF}'; }
-{
-  echo "host=$(hostname) zone=$(md zone) machine=$(md machine-type) cpus=$(nproc)"
-  echo "phase=$PHASE iterations=$ITER regional=$REGIONAL zonal=$ZONAL start=$(date -u +%FT%TZ)"
-  echo "kernel=$(uname -r) glibc=$(ldd --version | head -1 | awk '{print $NF}')"
-} | tee run-info.txt
-
-FAILED=0
-# run NAME BINARY ARGS... : one verified run; CSV is NAME.csv, log NAME.log.
-run() {
-  local name=$1; shift
-  echo "######## $name"
-  python3 "$VERIFY" "$name.path.json" -- "$@" --out="$name.csv" >"$name.log" 2>&1
-  local rc=$?
-  local bad
-  bad=$(python3 -c 'import csv,sys; print(sum(1 for r in csv.DictReader(open(sys.argv[1])) if r["ok"]=="0"))' "$name.csv" 2>/dev/null || echo "?")
-  echo "  exit=$rc failed_rows=$bad; $(tail -1 "$name.log")"
-  (( rc != 0 )) && FAILED=$((FAILED + 1))
-  gcloud storage cp --quiet "$name".* "gs://$OPS/results/$RUN/" >/dev/null 2>&1
-}
-
-# run_impl PREFIX IMPL ARGS... : one verified run of implementation IMPL
-# (uds, uds-ch4, inproc, inproc-ch4, rust, rust-unbuffered, native,
-# native-<sync>) named PREFIX-IMPL. The one place that maps an implementation
-# to its binary and flags, so every cell runs each implementation the same way.
-run_impl() {
-  local prefix=$1 impl=$2; shift 2
-  case $impl in
-    uds)             run "$prefix-$impl" "$UDS" "$@" "${SIDECAR_ARGS[@]}" ;;
-    uds-ch4)         run "$prefix-$impl" "$UDS" "$@" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
-    inproc)          run "$prefix-$impl" "$INPROC" "$@" "${SIDECAR_ARGS[@]}" ;;
-    inproc-ch4)      run "$prefix-$impl" "$INPROC" "$@" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
-    rust)            run "$prefix-$impl" "$RUST" "$@" ;;
-    rust-unbuffered) run "$prefix-$impl" "$RUST" "$@" --unbuffered --label=unbuffered ;;
-    native)          run "$prefix-$impl" "$NATIVE" "$@" --sync=grpc-cfe ;;
-    native-*)        run "$prefix-$impl" "$NATIVE" "$@" --sync="${impl#native-}" ;;
-    *) echo "run_impl: unknown implementation $impl" >&2; FAILED=$((FAILED + 1)) ;;
-  esac
-}
-
-# rotate N ITEMS... : prints ITEMS rotated left by N (ordering-bias control).
-rotate() { local n=$1; shift; local a=("$@"); local k=$((n % ${#a[@]})); echo "${a[@]:k}" "${a[@]:0:k}"; }
-
-if [[ "$PHASE" == "smoke" ]]; then
-  ITER=2
-  SIZES=(100000)
-  # Default flags first (no overrides), then the configured variants.
-  run smoke-default-uds "$UDS" --bucket="$REGIONAL" --iterations=$ITER
-  run smoke-default-inproc "$INPROC" --bucket="$REGIONAL" --iterations=$ITER
-  run smoke-default-native "$NATIVE" --bucket="$REGIONAL" --iterations=$ITER
-  run smoke-default-rust "$RUST" --bucket="$REGIONAL" --iterations=$ITER
-elif [[ "$PHASE" == "supplement" ]]; then
-  SIZES=(100000000)
-else
-  SIZES=(100000 2097152 100000000)
+# Row D3: verify Google Cloud Ops Agent is active before measuring.
+if ! systemctl is-active --quiet google-cloud-ops-agent; then
+  echo "FATAL: google-cloud-ops-agent is not active" >&2
+  exit 1
 fi
 
-# --- Regional · JSON · ReadObject/WriteObject (w1r3) -------------------------
-k=0
-for size in "${SIZES[@]}"; do
-  if [[ "$PHASE" == "supplement" ]]; then
-    w1r3_impls=(uds inproc native-json-h1 rust rust-unbuffered)
-  elif (( size == 100000000 )); then
-    w1r3_impls=(uds inproc native-json-h1 native-json-default native-grpc-cfe rust rust-unbuffered)
+md() {
+  curl -fsS -H Metadata-Flavor:Google "http://169.254.169.254/computeMetadata/v1/$1"
+}
+PROJECT="$(md project/project-id)"
+INSTANCE_ID="$(md instance/id)"
+ZONE="$(md instance/zone | awk -F/ '{print $NF}')"
+MACHINE="$(md instance/machine-type | awk -F/ '{print $NF}')"
+RUST_DIR="$HOME/poc/rust"
+[[ ! -d "$RUST_DIR" ]] && RUST_DIR="$BUILD/_deps/google_cloud_rust-src"
+RUST_SHA="$(git -C "$RUST_DIR" rev-parse HEAD 2>/dev/null || echo unknown)"
+CPP_SHA="$(git -C "$POC/.." rev-parse HEAD 2>/dev/null || echo unknown)"
+
+{
+  echo "host=$(hostname) project=$PROJECT instance_id=$INSTANCE_ID zone=$ZONE machine=$MACHINE cpus=$(nproc)"
+  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX start=$(date -u +%FT%TZ)"
+  echo "ops_agent=$(systemctl is-active google-cloud-ops-agent)"
+  echo "cpp_sha=$CPP_SHA rust_sha=$RUST_SHA"
+  echo "kernel=$(uname -r) glibc=$(ldd --version | head -1 | awk '{print $NF}')"
+} | tee run-info.txt
+gcloud storage cp --quiet run-info.txt "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+
+stop_daemon() {
+  pkill -x gcs-core-server 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    pgrep -x gcs-core-server >/dev/null 2>&1 || break
+    sleep 0.05
+  done
+}
+
+rotate() {
+  local n=$1
+  shift
+  local a=("$@")
+  local k=$((n % ${#a[@]}))
+  echo "${a[@]:k}" "${a[@]:0:k}"
+}
+
+FAILED=0
+
+if [[ "$PHASE" == "probes" ]]; then
+  PROBE_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  stop_daemon
+  python3 "$VERIFY" "probe-quickstart-regional.path.json" -- \
+    "$BUILD/quickstart" "$REGIONAL" | tee probe-quickstart-regional.log || FAILED=$((FAILED + 1))
+  python3 "$VERIFY" "probe-quickstart-zonal.path.json" -- \
+    "$BUILD/quickstart" --zonal "$ZONAL" | tee probe-quickstart-zonal.log || FAILED=$((FAILED + 1))
+  stop_daemon
+  python3 "$VERIFY" "probe-quickstart-inproc-regional.path.json" -- \
+    "$BUILD/quickstart_inproc" "$REGIONAL" | tee probe-quickstart-inproc-regional.log || FAILED=$((FAILED + 1))
+  python3 "$VERIFY" "probe-quickstart-inproc-zonal.path.json" -- \
+    "$BUILD/quickstart_inproc" --zonal "$ZONAL" | tee probe-quickstart-inproc-zonal.log || FAILED=$((FAILED + 1))
+  sleep 65
+  PROBE_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  python3 "$MON" --project="$PROJECT" --instance-id="$INSTANCE_ID" \
+    --start="$PROBE_START" --end="$PROBE_END" --wait-secs=180 \
+    --out="probe-monitoring.json" || FAILED=$((FAILED + 1))
+  echo "end=$(date -u +%FT%TZ) failed_runs=$FAILED" | tee -a run-info.txt
+  gcloud storage cp --quiet "$OUT"/* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  exit $((FAILED > 0 ? 1 : 0))
+fi
+
+if [[ "$PHASE" == "smoke" ]]; then
+  WARMUP=1
+  DUR_SHORT=3
+  DUR_LONG=4
+  THREADS_48=4
+else
+  WARMUP=10
+  DUR_SHORT=180
+  DUR_LONG=300
+  THREADS_48=48
+fi
+
+SUMMARY_FILES=()
+
+run_cell() {
+  local cell=$1
+  local mode=$2
+  shift 2
+  local name="${cell}-${mode}"
+  echo "######## $name ($(date -u +%FT%TZ))"
+  stop_daemon
+  python3 "$VERIFY" "$name.path.json" -- \
+    "$BENCH" --mode="$mode" \
+    --warmup-secs="$WARMUP" \
+    --out="$name.csv" \
+    --summary-json="$name.summary.json" \
+    "$@" >"$name.log" 2>&1
+  local rc=$?
+  stop_daemon
+  echo "  exit=$rc $(grep '^SUMMARY ' "$name.log" || tail -n 1 "$name.log")"
+  if (( rc != 0 )); then
+    FAILED=$((FAILED + 1))
   else
-    w1r3_impls=(uds inproc native-json-h1 native-json-default native-grpc-cfe rust)
+    SUMMARY_FILES+=("$name")
   fi
-  for impl in $(rotate $k "${w1r3_impls[@]}"); do
-    common=(--bucket="$REGIONAL" --workload=w1r3 --iterations="$ITER" --object-sizes="$size")
-    run_impl "w1r3-$size" "$impl" "${common[@]}"
+  gcloud storage cp --quiet "$name".* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+}
+
+COMPS=(native uds-sidecar uds-inproc)
+k=0
+
+# --- W1-W3 on zonal (and regional when allow-listed) --------------------------
+BIDI_TARGETS=("zonal:$ZONAL")
+if [[ "$ALLOW_REGIONAL_BIDI" == "1" ]]; then
+  BIDI_TARGETS+=("regional:$REGIONAL")
+fi
+
+for target in "${BIDI_TARGETS[@]}"; do
+  btype="${target%%:*}"
+  bname="${target#*:}"
+  for w in open read50x2x4-serial read50x2x4-concurrent random8k; do
+    for mode in $(rotate "$k" "${COMPS[@]}"); do
+      run_cell "${w}-${btype}" "$mode" \
+        --workload="$w" --bucket="$bname" --bucket-type="$btype" \
+        --duration-secs="$DUR_SHORT"
+    done
+    k=$((k + 1))
+  done
+
+  # --- W4: 48-thread BidiRead 16 MiB ranges of 200 MiB object -----------------
+  for mode in $(rotate "$k" "${COMPS[@]}"); do
+    run_cell "bidi-read-48t-${btype}" "$mode" \
+      --workload=bidi-read-48t --bucket="$bname" --bucket-type="$btype" \
+      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
   done
   k=$((k + 1))
 done
 
-if [[ "$PHASE" != "supplement" ]]; then
-  # --- ListObjects (gRPC; native JSON list as labelled context) --------------
-  LIST_ITER=100; [[ $PHASE == smoke ]] && LIST_ITER=2
-  for bucket_type in regional zonal; do
-    bucket=$REGIONAL; [[ $bucket_type == zonal ]] && bucket=$ZONAL
-    for impl in $(rotate $k uds inproc native-grpc-cfe rust native-json-h1); do
-      common=(--bucket="$bucket" --bucket-type=$bucket_type --workload=list --iterations="$LIST_ITER")
-      run_impl "list-$bucket_type" "$impl" "${common[@]}"
-    done
-    k=$((k + 1))
-  done
+# --- W5: 48-thread appendable BidiWrite 200 MB object + Finalize (zonal) ------
+for mode in $(rotate "$k" "${COMPS[@]}"); do
+  run_cell "bidi-write-48t-zonal" "$mode" \
+    --workload=bidi-write-48t --bucket="$ZONAL" --bucket-type=zonal \
+    --threads="$THREADS_48" --duration-secs="$DUR_LONG"
+done
+k=$((k + 1))
 
-  # --- gRPC bidi: Rapid Workload + appendable --------------------------------
-  # Regional: BidiReadObject is not enabled for the regional bucket in this
-  # project (PERMISSION_DENIED); 1 iteration per impl records the evidence.
-  for bucket_type in zonal regional; do
-    bucket=$ZONAL; it=$ITER
-    if [[ $bucket_type == regional ]]; then bucket=$REGIONAL; it=1; fi
-    for w in open random8k read50x2x4 appendable; do
-      [[ $bucket_type == regional && $w == appendable ]] && continue
-      witer=$it; [[ $w == read50x2x4 && $PHASE == full && $bucket_type == zonal ]] && witer=$(( ITER / 2 ))
-      for impl in $(rotate $k uds inproc native rust); do
-        common=(--bucket="$bucket" --bucket-type=$bucket_type --workload=$w --iterations="$witer" --object-sizes="$(IFS=,; echo "${SIZES[*]}")")
-        run_impl "$w-$bucket_type" "$impl" "${common[@]}"
-      done
-      k=$((k + 1))
-    done
-  done
-fi
+# --- W6: ListObjects (100 items, regional) & ListBuckets (100 items) ----------
+for mode in $(rotate "$k" "${COMPS[@]}"); do
+  run_cell "list-objects-100-regional" "$mode" \
+    --workload=list-objects-100 --bucket="$REGIONAL" --bucket-type=regional \
+    --duration-secs="$DUR_SHORT"
+done
+k=$((k + 1))
 
-# --- Throughput (concurrent 100 MB transfers) ------------------------------------
-TP_ITER="${TP_ITER:-5}"; [[ $PHASE == smoke ]] && TP_ITER=1
-for workers in 8 32; do
-  [[ $PHASE == smoke && $workers == 32 ]] && continue
-  for op in read write; do
-    # Regional JSON
-    if [[ "$op" == "write" ]]; then
-      tp_json_impls=(uds uds-ch4 inproc inproc-ch4 native-json-h1 rust rust-unbuffered)
-    else
-      tp_json_impls=(uds uds-ch4 inproc inproc-ch4 native-json-h1 rust)
-    fi
-    for impl in $(rotate $k "${tp_json_impls[@]}"); do
-      common=(--bucket="$REGIONAL" --workload=throughput --throughput-op=$op --workers=$workers --iterations=$TP_ITER --object-sizes=100000000)
-      run_impl "tp-json-$op-w$workers" "$impl" "${common[@]}"
-    done
-    # Zonal bidi
-    for impl in $(rotate $k uds uds-ch4 inproc inproc-ch4 native rust); do
-      common=(--bucket="$ZONAL" --bucket-type=zonal --workload=throughput --throughput-op=$op --workers=$workers --iterations=$TP_ITER --object-sizes=100000000)
-      run_impl "tp-bidi-$op-w$workers" "$impl" "${common[@]}"
-    done
-    k=$((k + 1))
-  done
+for mode in $(rotate "$k" "${COMPS[@]}"); do
+  run_cell "list-buckets-100-project" "$mode" \
+    --workload=list-buckets-100 --project="$PROJECT" \
+    --bucket-prefix="$BUCKET_PREFIX" --duration-secs="$DUR_SHORT"
+done
+k=$((k + 1))
+
+# --- Query Cloud Monitoring CPU & Ops Agent memory per cell window ------------
+echo "######## Querying Cloud Monitoring for ${#SUMMARY_FILES[@]} windows"
+for name in "${SUMMARY_FILES[@]}"; do
+  if ! python3 "$MON" \
+      --project="$PROJECT" \
+      --instance-id="$INSTANCE_ID" \
+      --summary-json="$name.summary.json" \
+      --wait-secs=180 \
+      --out="$name.monitoring.json"; then
+    echo "  monitoring FAILED for $name" >&2
+    FAILED=$((FAILED + 1))
+  else
+    gcloud storage cp --quiet "$name.monitoring.json" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  fi
 done
 
-if [[ "$PHASE" != "supplement" ]]; then
-  # --- Hop floor: synthetic core (no GCS), both boundaries ----------------------
-  # Same chunk × channels sweep for the sidecar and the in-process core; the
-  # abstract-socket link runs at the default chunk only, as a control for the
-  # channel type (descriptor "direct" channel vs. the resolver-based channel
-  # `uds` uses).
-  SYN_ITER=50; SYN_TP_ITER=10
-  [[ $PHASE == smoke ]] && SYN_ITER=2 && SYN_TP_ITER=1
-  for chunk in 262144 1048576 4194304; do
-    for channels in 1 4; do
-      for impl in $(rotate $k uds inproc); do
-        bin=$UDS; [[ $impl == inproc ]] && bin=$INPROC
-        run "synthetic-w1r3-c$chunk-ch$channels-$impl" "$bin" --bucket=synthetic --workload=w1r3 \
-          --iterations=$SYN_ITER --object-sizes=100000,2097152,100000000 --label=synthetic \
-          --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
-        run "synthetic-tp-c$chunk-ch$channels-$impl" "$bin" --bucket=synthetic --workload=throughput \
-          --workers=32 --iterations=$SYN_TP_ITER --object-sizes=100000000 --label=synthetic \
-          --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
-      done
-      k=$((k + 1))
-    done
-  done
-  for channels in 1 4; do
-    run "synthetic-w1r3-c1048576-ch$channels-inproc-abstract" "$INPROC" --bucket=synthetic --workload=w1r3 \
-      --iterations=$SYN_ITER --object-sizes=100000,2097152,100000000 --label=synthetic-abstract \
-      --channels=$channels --chunk-size=1048576 --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=1048576 \
-      --sidecar-arg=--link=abstract
-    run "synthetic-tp-c1048576-ch$channels-inproc-abstract" "$INPROC" --bucket=synthetic --workload=throughput \
-      --workers=32 --iterations=$SYN_TP_ITER --object-sizes=100000000 --label=synthetic-abstract \
-      --channels=$channels --chunk-size=1048576 --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=1048576 \
-      --sidecar-arg=--link=abstract
-  done
-fi
-
 echo "end=$(date -u +%FT%TZ) failed_runs=$FAILED" | tee -a run-info.txt
-gcloud storage cp --quiet run-info.txt "gs://$OPS/results/$RUN/" >/dev/null 2>&1
+gcloud storage cp --quiet run-info.txt "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
 echo "RUN=$RUN FAILED_RUNS=$FAILED"
+exit $((FAILED > 0 ? 1 : 0))

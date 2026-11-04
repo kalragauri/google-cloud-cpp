@@ -315,10 +315,10 @@ if (GCS_UDS_POC_BUILD_TESTS)
 endif ()
 
 # --- benchmarks -----------------------------------------------------------------
-# The phase-1 harness measured the wrapper's own API; the worklog's workloads
-# are measured through the unmodified google-cloud-cpp clients instead (plan
-# rev 4, step S3), so it stays off until it is ported.
-option(GCS_UDS_POC_BUILD_BENCH "Build the benchmark binaries" OFF)
-if (GCS_UDS_POC_BUILD_BENCH)
+# Unified benchmark binary (`uds_poc_bench`) driving all 3 comparators
+# (`native`, `uds-sidecar`, `uds-inproc`) through unmodified public
+# `google::cloud::storage::Client` and `google::cloud::storage::AsyncClient`.
+option(GCS_UDS_POC_BUILD_BENCH "Build the benchmark binary" ON)
+if (GCS_UDS_POC_BUILD_BENCH AND GCS_UDS_POC_BUILD_INPROC)
     add_subdirectory(bench)
 endif ()
