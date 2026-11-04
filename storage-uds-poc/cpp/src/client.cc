@@ -611,6 +611,13 @@ StatusOr<Client> Client::Create(ClientOptions const& options) {
 StatusOr<ObjectReader> Client::ReadObject(
     std::string const& bucket, std::string const& object, ReadRange range,
     std::int64_t generation, std::optional<std::int64_t> if_generation_match) {
+  if (generation < 0) {
+    return Status(StatusCode::kInvalidArgument, "generation must be >= 0");
+  }
+  if (if_generation_match.has_value() && *if_generation_match < 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  "if_generation_match must be >= 0");
+  }
   auto const [offset, length] = internal::ToOffsetLength(range);
   pb::ReadObjectRequest request;
   request.set_bucket(bucket);
@@ -634,6 +641,16 @@ StatusOr<ObjectWriter> Client::WriteObject(std::string const& bucket,
   if (options.mode == UploadMode::kSingleShot && !options.size_hint) {
     return Status(StatusCode::kInvalidArgument,
                   "UploadMode::kSingleShot requires size_hint");
+  }
+  if (options.size_hint.has_value() &&
+      *options.size_hint > static_cast<std::uint64_t>(
+                               std::numeric_limits<std::int64_t>::max())) {
+    return Status(StatusCode::kInvalidArgument, "size_hint exceeds INT64_MAX");
+  }
+  if (options.if_generation_match.has_value() &&
+      *options.if_generation_match < 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  "if_generation_match must be >= 0");
   }
   return ObjectWriter(std::make_unique<internal::WriterImpl>(
       conn_, internal::ToWriteHeader(options, bucket, object, pb::JSON),
@@ -701,6 +718,13 @@ StatusOr<ListBucketsPage> Client::ListBuckets(
 Status Client::DeleteObject(std::string const& bucket,
                             std::string const& object, std::int64_t generation,
                             std::optional<std::int64_t> if_generation_match) {
+  if (generation < 0) {
+    return Status(StatusCode::kInvalidArgument, "generation must be >= 0");
+  }
+  if (if_generation_match.has_value() && *if_generation_match < 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  "if_generation_match must be >= 0");
+  }
   pb::DeleteObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
@@ -715,6 +739,9 @@ Status Client::DeleteObject(std::string const& bucket,
 StatusOr<ObjectDescriptor> Client::OpenObject(std::string const& bucket,
                                               std::string const& object,
                                               std::int64_t generation) {
+  if (generation < 0) {
+    return Status(StatusCode::kInvalidArgument, "generation must be >= 0");
+  }
   pb::OpenObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
@@ -741,6 +768,11 @@ StatusOr<AppendableWriter> Client::StartAppendableUpload(
   if (options.size_hint.has_value()) {
     return Status(StatusCode::kInvalidArgument,
                   "StartAppendableUpload does not support size_hint");
+  }
+  if (options.if_generation_match.has_value() &&
+      *options.if_generation_match < 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  "if_generation_match must be >= 0");
   }
   return AppendableWriter(std::make_unique<internal::WriterImpl>(
       conn_, internal::ToWriteHeader(options, bucket, object, pb::GRPC),

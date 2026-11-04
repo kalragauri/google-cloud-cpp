@@ -400,6 +400,65 @@ TEST(SidecarClientTest, StaleSocketRemovedOnSpawn) {
   EXPECT_THAT(client->GetSidecarVersion(), IsOk());
 }
 
+/// @test Concurrent processes racing to spawn a daemon when a stale socket file
+/// already exists on disk serialize via `<socket>.lock` so losers never unlink
+/// the winner's newly bound listener (matrix B3 + B7).
+TEST(SidecarClientTest, DaemonConcurrentStaleSocketRace) {
+  ASSERT_FALSE(ColdStartBinary().empty()) << "GCS_CORE_COLD_START must be set";
+  std::string const socket = UniqueSocket("daemon-stale-race");
+  ScopedDaemonCleanup cleanup(socket);
+
+  int const fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, socket.data(), socket.size());
+  ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)),
+            0);
+  ::close(fd);
+
+  std::vector<SpawnedColdStart> procs;
+  procs.reserve(4);
+  for (int i = 0; i != 4; ++i) {
+    SpawnedColdStart p = StartColdStart({"--socket-path=" + socket});
+    ASSERT_GT(p.pid, 0);
+    procs.push_back(p);
+  }
+  std::vector<int> exit_codes;
+  std::vector<int> core_pids;
+  for (SpawnedColdStart p : procs) {
+    ColdStartResult r = FinishColdStart(p);
+    exit_codes.push_back(r.exit_code);
+    core_pids.push_back(r.core_pid);
+  }
+  EXPECT_THAT(exit_codes, Each(0));
+  ASSERT_THAT(core_pids, Each(Gt(0)));
+  EXPECT_THAT(core_pids, Each(core_pids.front()));
+}
+
+/// @test If the sidecar crashes mid-stream (`SIGKILL` while a streaming RPC is
+/// open), finishing the stream fails with `kUnavailable` and triggers automatic
+/// respawn so the next call succeeds with a fresh sidecar PID (matrix B6).
+TEST(SidecarClientTest, CrashMidStreamRespawnsOnNextCall) {
+  StatusOr<Client> client = Client::Create(ServerOptions());
+  ASSERT_THAT(client, IsOk());
+  int const first_pid = client->sidecar_pid();
+
+  StatusOr<ObjectWriter> writer =
+      client->WriteObject("bkt", "mid-stream-crash.bin");
+  ASSERT_THAT(writer, IsOk());
+  ASSERT_THAT(writer->Write(absl::Cord("chunk-before-crash")), IsOk());
+
+  ASSERT_EQ(::kill(first_pid, SIGKILL), 0);
+  WaitForExit(first_pid);
+
+  EXPECT_THAT(writer->Close(), StatusIs(StatusCode::kUnavailable));
+  StatusOr<SidecarVersion> recovered = client->GetSidecarVersion();
+  ASSERT_THAT(recovered, IsOk());
+  EXPECT_NE(client->sidecar_pid(), first_pid);
+  EXPECT_EQ(static_cast<int>(recovered->pid), client->sidecar_pid());
+}
+
 /// @test A sidecar process that never binds its socket times out cleanly and
 /// is terminated rather than leaked.
 TEST(SidecarClientTest, ReadinessTimeout) {

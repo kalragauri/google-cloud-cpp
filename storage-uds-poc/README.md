@@ -16,7 +16,7 @@
      ▼
  public SDK adapters (cpp/src/storage_connection.cc, async_connection.cc)
      │  gcs_core::Client — framing, status mapping; backend seam (core_backend.h)
-     │    sidecar daemon (default): unix:/run/user/<uid>/gcs-core-daemon.sock → shared gcs-core-server
+     │    sidecar daemon (default): unix:/run/user/<uid>/gcs-core.sock        → shared gcs-core-server
      │    sidecar child (--child):  unix:/run/user/<uid>/gcs-core-<pid>.sock  → 1:1 gcs-core-server
      │    in-process:               unix-abstract:gcs-core-<pid>-<n>          → Tokio threads "gcs-core-inproc"
      ▼
@@ -30,7 +30,7 @@
 
 CMake fetches `google-cloud-rust` (`GCS_CORE_RUST_REPO`, default the
 `kalragauri` fork) at `GCS_CORE_RUST_REF` (branch `grpc-uds-cpp` or pinned
-commit SHA: `googleapis/google-cloud-rust` PR #7350 plus our four follow-up
+commit SHA: `googleapis/google-cloud-rust` PR #7350 plus our five follow-up
 commits) and builds `storage-grpc-uds` with `cargo`. Nothing from the server is
 copied into this tree. For local iteration on the server, point CMake at a
 worktree:
@@ -68,21 +68,28 @@ ctest --test-dir cmake-out --output-on-failure
 ## Operational notes
 
 * **Sidecar modes (`SidecarMode::kDaemon` vs `SidecarMode::kChild`).**
-  `SidecarMode::kDaemon` (default) attaches to or flock-spawns a per-UID shared
+  `SidecarMode::kDaemon` (default) attaches to or spawns a per-UID shared
   `gcs-core-server` (`--pdeathsig=false --idle-secs=300`) at
-  `$XDG_RUNTIME_DIR/gcs-core-daemon.sock` (fallback `/tmp/gcs-core-<uid>/`).
+  `$XDG_RUNTIME_DIR/gcs-core.sock` (fallback `/tmp/gcs-core-<uid>/`), serialized
+  across concurrent spawners via an exclusive `flock` on `<socket>.lock`.
   `SidecarMode::kChild` spawns a 1:1 child (`--pdeathsig=true --idle-secs=0`)
   from a dedicated process-lifetime helper thread so Linux's thread-bound
-  `PR_SET_PDEATHSIG` delivers `SIGKILL` if the parent crashes.
+  `PR_SET_PDEATHSIG` delivers `SIGTERM` if the parent crashes.
 * **In-process variant (`gcs_core_storage_inproc`).** Links
   `libstorage_grpc_uds.a` into the host binary and binds an abstract Unix
   socket (`unix-abstract:gcs-core-<pid>-<n>`), avoiding filesystem socket paths
   while keeping the identical gRPC wire contract.
+* **Upload cancellation (`ObjectWriteStream`).** By default, destroying an
+  unclosed `google::cloud::storage::ObjectWriteStream` auto-finalizes buffered
+  bytes (`AutoFinalizeEnabled()`). To cancel an in-flight upload over UDS
+  without committing a partial object, pass `AutoFinalizeDisabled()` (or call
+  `std::move(stream).Suspend()`) and invoke
+  `client.DeleteResumableUpload(session_id)`.
 * **Credentials.** Both sides resolve Application Default Credentials
   independently; in-process credential resolution runs inside the host process,
   whereas custom C++ `google::cloud::Credentials` callbacks cannot cross the
-  `gcscore.v1` boundary (`StorageCredentialsOption` is rejected with
-  `kInvalidArgument`).
+  `gcscore.v1` boundary (`UnifiedCredentialsOption` and `GrpcCredentialOption`
+  are rejected with `kUnimplemented`).
 * **`fork()` safety.** Consistent with gRPC C++ and Tokio multi-threaded
   runtimes, calling `fork()` without `exec()` after creating a `Client` or
   `AsyncClient` (in either sidecar or in-process mode) is unsupported: neither

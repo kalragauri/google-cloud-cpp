@@ -86,6 +86,20 @@ Status UnimplementedAsyncOption(std::string_view field,
                              " over UDS (gcscore.v1.GcsCore)"));
 }
 
+template <typename Proto>
+Status CheckAsyncPreconditions(Proto const& proto, std::string_view method) {
+  if (proto.has_if_generation_not_match()) {
+    return UnimplementedAsyncOption("if_generation_not_match", method);
+  }
+  if (proto.has_if_metageneration_match()) {
+    return UnimplementedAsyncOption("if_metageneration_match", method);
+  }
+  if (proto.has_if_metageneration_not_match()) {
+    return UnimplementedAsyncOption("if_metageneration_not_match", method);
+  }
+  return {};
+}
+
 StatusOr<Options> ValidateAndDefaultAsyncOptions(Options opts) {
   if (opts.has<google::cloud::UnifiedCredentialsOption>() ||
       opts.has<google::cloud::GrpcCredentialOption>()) {
@@ -811,25 +825,20 @@ class UdsAsyncConnection : public gcs::AsyncConnection {
   future<StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>> Open(
       OpenParams p) override {
     google::storage::v2::BidiReadObjectSpec const& spec = p.read_spec;
-    if (spec.has_if_generation_not_match()) {
+    if (Status s = CheckAsyncPreconditions(spec, "Open"); !s.ok()) {
       return make_ready_future(
           StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>(
-              UnimplementedAsyncOption("if_generation_not_match", "Open")));
-    }
-    if (spec.has_if_metageneration_match()) {
-      return make_ready_future(
-          StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>(
-              UnimplementedAsyncOption("if_metageneration_match", "Open")));
-    }
-    if (spec.has_if_metageneration_not_match()) {
-      return make_ready_future(
-          StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>(
-              UnimplementedAsyncOption("if_metageneration_not_match", "Open")));
+              std::move(s)));
     }
     if (spec.has_if_generation_match()) {
       return make_ready_future(
           StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>(
               UnimplementedAsyncOption("if_generation_match", "Open")));
+    }
+    if (spec.generation() < 0) {
+      return make_ready_future(
+          StatusOr<std::shared_ptr<gcs::ObjectDescriptorConnection>>(Status(
+              StatusCode::kInvalidArgument, "Open: generation must be >= 0")));
     }
 
     std::string bucket_id = gcs_internal::GrpcBucketNameToId(spec.bucket());
@@ -896,23 +905,17 @@ class UdsAsyncConnection : public gcs::AsyncConnection {
     }
     google::storage::v2::WriteObjectSpec const& spec =
         p.request.write_object_spec();
-    if (spec.has_if_generation_not_match()) {
+    if (Status s = CheckAsyncPreconditions(spec, "StartAppendableObjectUpload");
+        !s.ok()) {
       return make_ready_future(
-          StatusOr<std::unique_ptr<gcs::AsyncWriterConnection>>(
-              UnimplementedAsyncOption("if_generation_not_match",
-                                       "StartAppendableObjectUpload")));
+          StatusOr<std::unique_ptr<gcs::AsyncWriterConnection>>(std::move(s)));
     }
-    if (spec.has_if_metageneration_match()) {
+    if (spec.has_if_generation_match() && spec.if_generation_match() < 0) {
       return make_ready_future(
           StatusOr<std::unique_ptr<gcs::AsyncWriterConnection>>(
-              UnimplementedAsyncOption("if_metageneration_match",
-                                       "StartAppendableObjectUpload")));
-    }
-    if (spec.has_if_metageneration_not_match()) {
-      return make_ready_future(
-          StatusOr<std::unique_ptr<gcs::AsyncWriterConnection>>(
-              UnimplementedAsyncOption("if_metageneration_not_match",
-                                       "StartAppendableObjectUpload")));
+              Status(StatusCode::kInvalidArgument,
+                     "StartAppendableObjectUpload: if_generation_match must be "
+                     ">= 0")));
     }
     if (p.request.has_common_object_request_params()) {
       return make_ready_future(
@@ -999,17 +1002,17 @@ class UdsAsyncConnection : public gcs::AsyncConnection {
 
   future<Status> DeleteObject(DeleteObjectParams p) override {
     google::storage::v2::DeleteObjectRequest const& r = p.request;
-    if (r.has_if_generation_not_match()) {
-      return make_ready_future(
-          UnimplementedAsyncOption("if_generation_not_match", "DeleteObject"));
+    if (Status s = CheckAsyncPreconditions(r, "DeleteObject"); !s.ok()) {
+      return make_ready_future(std::move(s));
     }
-    if (r.has_if_metageneration_match()) {
-      return make_ready_future(
-          UnimplementedAsyncOption("if_metageneration_match", "DeleteObject"));
+    if (r.generation() < 0) {
+      return make_ready_future(Status(StatusCode::kInvalidArgument,
+                                      "DeleteObject: generation must be >= 0"));
     }
-    if (r.has_if_metageneration_not_match()) {
-      return make_ready_future(UnimplementedAsyncOption(
-          "if_metageneration_not_match", "DeleteObject"));
+    if (r.has_if_generation_match() && r.if_generation_match() < 0) {
+      return make_ready_future(
+          Status(StatusCode::kInvalidArgument,
+                 "DeleteObject: if_generation_match must be >= 0"));
     }
 
     pb::DeleteObjectRequest req;

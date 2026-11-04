@@ -41,6 +41,7 @@
 #include "google/cloud/status_or.h"
 #include "absl/strings/cord.h"
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "gcs_core/client.h"
 #include "gcs_core/storage_client.h"
@@ -119,6 +120,7 @@ struct Config {
   int uds_channels = 4;
   int grpc_subchannels = 4;
   int cq_threads = 0;
+  int worker_threads = 0;
   std::uint32_t chunk_size_hint = 0;
   bool child_mode = false;
   std::string socket_path;
@@ -432,6 +434,11 @@ gc::StatusOr<Clients> BuildClients(Config const& cfg) {
     core_opts.sidecar_args.push_back(
         absl::StrCat("--grpc-subchannels=", cfg.grpc_subchannels));
   }
+  if (cfg.worker_threads > 0 &&
+      !HasFlagPrefix(core_opts.sidecar_args, "--worker-threads")) {
+    core_opts.sidecar_args.push_back(
+        absl::StrCat("--worker-threads=", cfg.worker_threads));
+  }
 
   gc::StatusOr<gcs_core::Client> ctrl = gcs_core::Client::Create(core_opts);
   if (!ctrl) return std::move(ctrl).status();
@@ -681,6 +688,7 @@ void WriteSummaryJson(std::ostream& out, Config const& cfg,
       << "  \"uds_channels\": " << cfg.uds_channels << ",\n"
       << "  \"grpc_subchannels\": " << cfg.grpc_subchannels << ",\n"
       << "  \"cq_threads\": " << cfg.cq_threads << ",\n"
+      << "  \"worker_threads\": " << cfg.worker_threads << ",\n"
       << "  \"object_size\": " << cfg.object_size << ",\n"
       << "  \"range_size\": " << cfg.range_size << ",\n"
       << R"(  "window_start_utc": ")" << window_start_utc << "\",\n"
@@ -758,6 +766,42 @@ void WriteSummaryJson(std::ostream& out, Config const& cfg,
 }
 
 bool ParseFlags(int argc, char* argv[], Config& cfg) {
+  auto parse_nonneg_double = [](std::string_view key, std::string_view val,
+                                double* out) {
+    double v = 0.0;
+    if (!absl::SimpleAtod(val, &v) || !std::isfinite(v) || v < 0.0) {
+      std::cerr << key << " requires a finite non-negative number: " << val
+                << "\n";
+      return false;
+    }
+    *out = v;
+    return true;
+  };
+  auto parse_int = [](std::string_view key, std::string_view val, int* out) {
+    if (!absl::SimpleAtoi(val, out)) {
+      std::cerr << key << " requires an integer: " << val << "\n";
+      return false;
+    }
+    return true;
+  };
+  auto parse_i64 = [](std::string_view key, std::string_view val,
+                      std::int64_t* out) {
+    if (!absl::SimpleAtoi(val, out)) {
+      std::cerr << key << " requires a 64-bit integer: " << val << "\n";
+      return false;
+    }
+    return true;
+  };
+  auto parse_u32 = [](std::string_view key, std::string_view val,
+                      std::uint32_t* out) {
+    if (!absl::SimpleAtoi(val, out)) {
+      std::cerr << key << " requires an unsigned 32-bit integer: " << val
+                << "\n";
+      return false;
+    }
+    return true;
+  };
+
   for (int i = 1; i < argc; ++i) {
     std::string const arg = argv[i];
     std::size_t const eq = arg.find('=');
@@ -779,29 +823,37 @@ bool ParseFlags(int argc, char* argv[], Config& cfg) {
     } else if (key == "--prefix") {
       cfg.prefix = val;
     } else if (key == "--duration-secs") {
-      cfg.duration_secs = std::stod(val);
+      if (!parse_nonneg_double(key, val, &cfg.duration_secs)) return false;
     } else if (key == "--warmup-secs") {
-      cfg.warmup_secs = std::stod(val);
+      if (!parse_nonneg_double(key, val, &cfg.warmup_secs)) return false;
     } else if (key == "--max-ops") {
-      cfg.max_ops = std::stoi(val);
+      if (!parse_int(key, val, &cfg.max_ops) || cfg.max_ops < 0) {
+        std::cerr << "--max-ops must be >= 0\n";
+        return false;
+      }
     } else if (key == "--threads") {
-      cfg.threads = std::stoi(val);
+      if (!parse_int(key, val, &cfg.threads)) return false;
     } else if (key == "--object-size") {
-      cfg.object_size = std::stoll(val);
+      if (!parse_i64(key, val, &cfg.object_size)) return false;
     } else if (key == "--range-size") {
-      cfg.range_size = std::stoll(val);
+      if (!parse_i64(key, val, &cfg.range_size)) return false;
     } else if (key == "--write-chunk-size") {
-      cfg.write_chunk_size = std::stoll(val);
+      if (!parse_i64(key, val, &cfg.write_chunk_size)) return false;
     } else if (key == "--list-count") {
-      cfg.list_count = std::stoi(val);
+      if (!parse_int(key, val, &cfg.list_count)) return false;
     } else if (key == "--uds-channels") {
-      cfg.uds_channels = std::stoi(val);
+      if (!parse_int(key, val, &cfg.uds_channels)) return false;
     } else if (key == "--grpc-subchannels") {
-      cfg.grpc_subchannels = std::stoi(val);
+      if (!parse_int(key, val, &cfg.grpc_subchannels)) return false;
     } else if (key == "--cq-threads") {
-      cfg.cq_threads = std::stoi(val);
+      if (!parse_int(key, val, &cfg.cq_threads)) return false;
+    } else if (key == "--worker-threads") {
+      if (!parse_int(key, val, &cfg.worker_threads) || cfg.worker_threads < 0) {
+        std::cerr << "--worker-threads must be >= 0\n";
+        return false;
+      }
     } else if (key == "--chunk-size-hint") {
-      cfg.chunk_size_hint = static_cast<std::uint32_t>(std::stoul(val));
+      if (!parse_u32(key, val, &cfg.chunk_size_hint)) return false;
     } else if (arg == "--child-mode") {
       cfg.child_mode = true;
     } else if (key == "--socket-path") {

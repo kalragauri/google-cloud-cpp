@@ -25,6 +25,7 @@
 // process (`core`).
 
 #include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "gcs_core/client.h"
 #include <chrono>
 #include <fstream>
@@ -54,19 +55,27 @@ int main(int argc, char* argv[]) {
   int hold_ms = 0;
   for (int i = 1; i < argc; ++i) {
     std::string const arg = argv[i];
+    if (arg == "--child") {
+      options.sidecar_mode = gcs_core::SidecarMode::kChild;
+      continue;
+    }
     std::size_t const eq = arg.find('=');
     std::string const key = arg.substr(0, eq);
     std::string const val =
         eq == std::string::npos ? std::string() : arg.substr(eq + 1);
-    if (key == "--channels") {
-      options.channels = std::stoi(val);
-    } else if (key == "--socket-path") {
+    if (eq != std::string::npos && key == "--channels") {
+      if (!absl::SimpleAtoi(val, &options.channels)) {
+        std::cerr << "invalid --channels value: " << val << "\n";
+        return 2;
+      }
+    } else if (eq != std::string::npos && key == "--socket-path") {
       options.socket_path = val;
-    } else if (arg == "--child") {
-      options.sidecar_mode = gcs_core::SidecarMode::kChild;
-    } else if (key == "--hold-ms") {
-      hold_ms = std::stoi(val);
-    } else if (key == "--sidecar-arg") {
+    } else if (eq != std::string::npos && key == "--hold-ms") {
+      if (!absl::SimpleAtoi(val, &hold_ms) || hold_ms < 0) {
+        std::cerr << "invalid --hold-ms value: " << val << "\n";
+        return 2;
+      }
+    } else if (eq != std::string::npos && key == "--sidecar-arg") {
       options.sidecar_args.push_back(val);
     } else {
       std::cerr << "usage: cold_start [--channels=N] [--socket-path=PATH] "

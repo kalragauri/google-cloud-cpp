@@ -35,6 +35,7 @@
 #include "status.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -60,6 +61,14 @@ using ::google::cloud::StatusCode;
 constexpr std::size_t kDefaultUploadBufferSize = 8 * 1024 * 1024;
 constexpr std::size_t kDefaultDownloadBufferSize = 1024 * 1024;
 constexpr std::size_t kDefaultMaxSimpleUploadSize = 20 * 1024 * 1024;
+// Bounds in-memory upload sessions on a long-lived `Client` when callers
+// abandon `Suspend()` / `AutoFinalizeDisabled()` streams without calling
+// `DeleteResumableUpload`: sessions idle longer than `kAbandonedUploadIdleTtl`
+// are reaped on `CreateResumableUpload`, and exceeding `kMaxActiveUploads`
+// concurrent live sessions returns `kResourceExhausted` rather than evicting an
+// active upload.
+constexpr std::size_t kMaxActiveUploads = 1024;
+constexpr std::chrono::minutes kAbandonedUploadIdleTtl{10};
 
 Status UnimplementedMethod(std::string_view method) {
   return Status(StatusCode::kUnimplemented,
@@ -74,6 +83,53 @@ Status UnimplementedOption(std::string_view option, std::string_view method) {
                              " over UDS (gcscore.v1.GcsCore)"));
 }
 
+#include "google/cloud/internal/disable_deprecation_warnings.inc"
+template <typename Request>
+Status CheckDeprecatedHashOptions(Request const& request,
+                                  std::string_view method) {
+  if (request.template HasOption<gcs::Crc32cChecksumValue>()) {
+    return UnimplementedOption("Crc32cChecksumValue", method);
+  }
+  if (request.template HasOption<gcs::MD5HashValue>()) {
+    return UnimplementedOption("MD5HashValue", method);
+  }
+  if (request.template HasOption<gcs::DisableMD5Hash>() &&
+      !request.template GetOption<gcs::DisableMD5Hash>().value()) {
+    return UnimplementedOption("EnableMD5Hash", method);
+  }
+  return {};
+}
+#include "google/cloud/internal/diagnostics_pop.inc"
+
+Status CheckChecksumAlgorithmOptions(Options const& opts,
+                                     std::string_view scope) {
+  if (opts.has<gcs::PrecomputedChecksumsOption>()) {
+    gcs::PrecomputedChecksums const& p =
+        opts.get<gcs::PrecomputedChecksumsOption>();
+    if (!p.crc32c.empty() || !p.md5.empty()) {
+      return UnimplementedOption("PrecomputedChecksumsOption", scope);
+    }
+  }
+  if (opts.has<gcs::UploadChecksumValidationOption>()) {
+    gcs::ChecksumAlgorithm const alg =
+        opts.get<gcs::UploadChecksumValidationOption>();
+    if (alg == gcs::ChecksumAlgorithm::kMD5 ||
+        alg == gcs::ChecksumAlgorithm::kCrc32cAndMD5) {
+      return UnimplementedOption("UploadChecksumValidationOption(MD5)", scope);
+    }
+  }
+  if (opts.has<gcs::DownloadChecksumValidationOption>()) {
+    gcs::ChecksumAlgorithm const alg =
+        opts.get<gcs::DownloadChecksumValidationOption>();
+    if (alg == gcs::ChecksumAlgorithm::kMD5 ||
+        alg == gcs::ChecksumAlgorithm::kCrc32cAndMD5) {
+      return UnimplementedOption("DownloadChecksumValidationOption(MD5)",
+                                 scope);
+    }
+  }
+  return {};
+}
+
 template <typename Request>
 Status CheckCommonPreconditions(Request const& request,
                                 std::string_view method) {
@@ -86,12 +142,23 @@ Status CheckCommonPreconditions(Request const& request,
   if (request.template HasOption<gcs::IfMetagenerationNotMatch>()) {
     return UnimplementedOption("IfMetagenerationNotMatch", method);
   }
+  if (request.template HasOption<gcs::IfGenerationMatch>() &&
+      request.template GetOption<gcs::IfGenerationMatch>().value() < 0) {
+    return Status(StatusCode::kInvalidArgument,
+                  absl::StrCat(method, ": IfGenerationMatch must be >= 0"));
+  }
   return {};
 }
 
 template <typename Request>
 Status CheckWriteOptions(Request const& request, std::string_view method) {
   if (Status s = CheckCommonPreconditions(request, method); !s.ok()) return s;
+  if (Status s = CheckDeprecatedHashOptions(request, method); !s.ok()) return s;
+  if (Status s = CheckChecksumAlgorithmOptions(
+          google::cloud::internal::CurrentOptions(), method);
+      !s.ok()) {
+    return s;
+  }
   if (request.template HasOption<gcs::EncryptionKey>()) {
     return UnimplementedOption("EncryptionKey", method);
   }
@@ -102,16 +169,26 @@ Status CheckWriteOptions(Request const& request, std::string_view method) {
 }
 
 template <typename Request>
-std::string ExtractContentType(Request const& request) {
-  if (request.template HasOption<gcs::ContentType>()) {
-    return request.template GetOption<gcs::ContentType>().value();
-  }
+StatusOr<std::string> ExtractContentType(Request const& request,
+                                         std::string_view method) {
+  std::string content_type;
   if (request.template HasOption<gcs::WithObjectMetadata>()) {
-    return request.template GetOption<gcs::WithObjectMetadata>()
-        .value()
-        .content_type();
+    auto const opt = request.template GetOption<gcs::WithObjectMetadata>();
+    gcs::ObjectMetadata const& meta = opt.value();
+    gcs::ObjectMetadata only_content_type;
+    if (!meta.content_type().empty()) {
+      only_content_type.set_content_type(meta.content_type());
+    }
+    if (meta != only_content_type) {
+      return UnimplementedOption(
+          "WithObjectMetadata (fields other than content_type)", method);
+    }
+    content_type = meta.content_type();
   }
-  return {};
+  if (request.template HasOption<gcs::ContentType>()) {
+    content_type = request.template GetOption<gcs::ContentType>().value();
+  }
+  return content_type;
 }
 
 StatusOr<Options> ValidateAndDefaultStorageOptions(Options opts) {
@@ -122,6 +199,10 @@ StatusOr<Options> ValidateAndDefaultStorageOptions(Options opts) {
         "UnifiedCredentialsOption / GrpcCredentialOption are not supported "
         "over UDS; the shared Rust server authenticates using Application "
         "Default Credentials");
+  }
+  if (Status s = CheckChecksumAlgorithmOptions(opts, "MakeUdsStorageClient");
+      !s.ok()) {
+    return s;
   }
   if (opts.has<gcs::RetryPolicyOption>() ||
       opts.has<gcs::BackoffPolicyOption>() ||
@@ -376,8 +457,21 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     if (Status s = CheckCommonPreconditions(request, "ReadObject"); !s.ok()) {
       return s;
     }
+    if (Status s = CheckDeprecatedHashOptions(request, "ReadObject"); !s.ok()) {
+      return s;
+    }
+    if (Status s = CheckChecksumAlgorithmOptions(
+            google::cloud::internal::CurrentOptions(), "ReadObject");
+        !s.ok()) {
+      return s;
+    }
     if (request.HasOption<gcs::EncryptionKey>()) {
       return UnimplementedOption("EncryptionKey", "ReadObject");
+    }
+    if (request.HasOption<gcs::Generation>() &&
+        request.GetOption<gcs::Generation>().value() < 0) {
+      return Status(StatusCode::kInvalidArgument,
+                    "ReadObject: Generation must be >= 0");
     }
     StatusOr<std::pair<std::int64_t, std::int64_t>> range =
         ParseReadRange(request);
@@ -410,6 +504,10 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     if (Status s = CheckWriteOptions(request, "InsertObjectMedia"); !s.ok()) {
       return s;
     }
+    StatusOr<std::string> content_type =
+        ExtractContentType(request, "InsertObjectMedia");
+    if (!content_type) return std::move(content_type).status();
+
     std::string_view slice(request.payload().data(), request.payload().size());
     if (request.HasOption<gcs::UploadFromOffset>()) {
       std::uint64_t const off =
@@ -427,11 +525,10 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
       }
     }
 
-    std::string const content_type = ExtractContentType(request);
     pb::WriteHeader header;
     header.set_bucket(request.bucket_name());
     header.set_object(request.object_name());
-    header.set_content_type(content_type);
+    header.set_content_type(*content_type);
     if (request.HasOption<gcs::IfGenerationMatch>()) {
       header.set_if_generation_match(
           request.GetOption<gcs::IfGenerationMatch>().value());
@@ -446,7 +543,7 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     StatusOr<pb::WriteObjectResponse> resp = writer.Finish();
     if (!resp) return std::move(resp).status();
     return ToSdkObjectMetadata(*resp, request.bucket_name(),
-                               request.object_name(), content_type);
+                               request.object_name(), *content_type);
   }
 
   StatusOr<gcs_internal::CreateResumableUploadResponse> CreateResumableUpload(
@@ -462,8 +559,10 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
         !s.ok()) {
       return s;
     }
+    StatusOr<std::string> content_type =
+        ExtractContentType(request, "CreateResumableUpload");
+    if (!content_type) return std::move(content_type).status();
 
-    std::string const content_type = ExtractContentType(request);
     std::size_t const buffer_size =
         request.HasOption<gcs::UploadBufferSize>()
             ? request.GetOption<gcs::UploadBufferSize>().value()
@@ -475,7 +574,7 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     pb::WriteHeader header;
     header.set_bucket(request.bucket_name());
     header.set_object(request.object_name());
-    header.set_content_type(content_type);
+    header.set_content_type(*content_type);
     if (request.HasOption<gcs::IfGenerationMatch>()) {
       header.set_if_generation_match(
           request.GetOption<gcs::IfGenerationMatch>().value());
@@ -483,23 +582,54 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     // Leave `known_size` unset unless the caller declared `UploadContentLength`
     // so the Rust server streams a resumable upload with bounded memory.
     if (request.HasOption<gcs::UploadContentLength>()) {
-      header.set_known_size(static_cast<std::int64_t>(
-          request.GetOption<gcs::UploadContentLength>().value()));
+      std::uint64_t const declared_len =
+          request.GetOption<gcs::UploadContentLength>().value();
+      if (declared_len > static_cast<std::uint64_t>(
+                             std::numeric_limits<std::int64_t>::max())) {
+        return Status(StatusCode::kInvalidArgument,
+                      "CreateResumableUpload: UploadContentLength exceeds "
+                      "INT64_MAX");
+      }
+      header.set_known_size(static_cast<std::int64_t>(declared_len));
     }
     header.set_chunk_size(clamped_buffer);
     header.set_transport(pb::JSON);
 
+    auto const now = std::chrono::steady_clock::now();
     auto session = std::make_shared<UploadSession>();
     session->bucket = request.bucket_name();
     session->object = request.object_name();
-    session->content_type = content_type;
+    session->content_type = *content_type;
     session->writer = std::make_unique<internal::WriterImpl>(
         conn_, std::move(header), chunk_size_hint_);
+    session->last_activity = now;
 
     std::string const id = absl::StrCat("uds-upload-", ++next_upload_id_);
+    std::vector<std::shared_ptr<UploadSession>> evicted;
+    bool at_capacity = false;
     {
       std::scoped_lock lk(uploads_mu_);
-      uploads_.emplace(id, std::move(session));
+      for (auto it = uploads_.begin(); it != uploads_.end();) {
+        if (now - it->second->last_activity > kAbandonedUploadIdleTtl) {
+          evicted.push_back(std::move(it->second));
+          it = uploads_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+      if (uploads_.size() >= kMaxActiveUploads) {
+        at_capacity = true;
+      } else {
+        uploads_.emplace(id, std::move(session));
+      }
+    }
+    evicted.clear();
+    session.reset();
+    if (at_capacity) {
+      return Status(
+          StatusCode::kResourceExhausted,
+          "CreateResumableUpload: active upload session limit (1024) reached; "
+          "finalize or DeleteResumableUpload abandoned streams");
     }
     return gcs_internal::CreateResumableUploadResponse{id};
   }
@@ -544,6 +674,7 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
       if (it == uploads_.end()) {
         return Status(StatusCode::kNotFound, "unknown upload session");
       }
+      it->second->last_activity = std::chrono::steady_clock::now();
       session = it->second;
     }
 
@@ -619,6 +750,10 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     if (request.HasOption<gcs::MaxResults>()) {
       std::int64_t const max_results =
           request.GetOption<gcs::MaxResults>().value();
+      if (max_results < 0) {
+        return Status(StatusCode::kInvalidArgument,
+                      "ListObjects: MaxResults must be >= 0");
+      }
       proto.set_page_size(static_cast<std::int32_t>(std::min<std::int64_t>(
           max_results, std::numeric_limits<std::int32_t>::max())));
     }
@@ -656,6 +791,10 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     if (request.HasOption<gcs::MaxResults>()) {
       std::int64_t const max_results =
           request.GetOption<gcs::MaxResults>().value();
+      if (max_results < 0) {
+        return Status(StatusCode::kInvalidArgument,
+                      "ListBuckets: MaxResults must be >= 0");
+      }
       proto.set_page_size(static_cast<std::int32_t>(std::min<std::int64_t>(
           max_results, std::numeric_limits<std::int32_t>::max())));
     }
@@ -685,7 +824,12 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     proto.set_bucket(request.bucket_name());
     proto.set_object(request.object_name());
     if (request.HasOption<gcs::Generation>()) {
-      proto.set_generation(request.GetOption<gcs::Generation>().value());
+      std::int64_t const gen = request.GetOption<gcs::Generation>().value();
+      if (gen < 0) {
+        return Status(StatusCode::kInvalidArgument,
+                      "DeleteObject: Generation must be >= 0");
+      }
+      proto.set_generation(gen);
     }
     if (request.HasOption<gcs::IfGenerationMatch>()) {
       proto.set_if_generation_match(
@@ -924,6 +1068,7 @@ class UdsStorageConnection : public gcs_internal::StorageConnection {
     std::string content_type;
     std::unique_ptr<internal::WriterImpl> writer;
     std::uint64_t bytes_accepted = 0;
+    std::chrono::steady_clock::time_point last_activity;
   };
 
   void EraseUploadSession(std::string const& id) {

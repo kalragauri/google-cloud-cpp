@@ -48,6 +48,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iterator>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -834,40 +835,42 @@ TEST_F(AdapterFakeTest, ContentType) {
   EXPECT_EQ(fake_.writes.back().front().header().content_type(), "text/csv");
 }
 
-/// @test Matrix row A12: an upload cancelled via `DeleteResumableUpload` or
-/// connection destruction before finalization cancels the UDS stream and never
-/// commits an object.
+/// @test Matrix row A12: an upload cancelled via `AutoFinalizeDisabled()` +
+/// `Client::DeleteResumableUpload` on a live `Client`, or via connection
+/// destruction after `Suspend()`, cancels the UDS stream and never commits an
+/// object.
 TEST_F(AdapterFakeTest, AbandonedUpload) {
+  StatusOr<gcs::Client> live_client = MakeUdsStorageClient(
+      CoreOpts(), Options{}.set<gcs::UploadBufferSizeOption>(256 * 1024));
+  ASSERT_THAT(live_client, IsOk());
+  std::string session_id;
   {
-    StatusOr<std::shared_ptr<gcs_internal::StorageConnection>> conn =
-        MakeUdsStorageConnection(CoreOpts());
-    ASSERT_THAT(conn, IsOk());
-    StatusOr<gcs_internal::CreateResumableUploadResponse> created =
-        (*conn)->CreateResumableUpload(
-            gcs_internal::ResumableUploadRequest("bkt", "abandoned-1"));
-    ASSERT_THAT(created, IsOk());
-
-    std::string const part(256 * 1024, 'p');
-    gcs_internal::UploadChunkRequest chunk_req(
-        created->upload_id, 0,
-        gcs_internal::ConstBufferSequence{
-            gcs_internal::ConstBuffer(part.data(), part.size())},
-        gcs_internal::CreateNullHashFunction());
-    ASSERT_THAT((*conn)->UploadChunk(chunk_req), IsOk());
-    ASSERT_THAT(
-        (*conn)->DeleteResumableUpload(
-            gcs_internal::DeleteResumableUploadRequest(created->upload_id)),
-        IsOk());
+    gcs::ObjectWriteStream stream = live_client->WriteObject(
+        "bkt", "abandoned-1", gcs::AutoFinalizeDisabled());
+    session_id = stream.resumable_session_id();
+    ASSERT_FALSE(session_id.empty());
+    std::string const part(300 * 1024, 'p');
+    stream.write(part.data(), static_cast<std::streamsize>(part.size()));
+    // Destroying `stream` with `AutoFinalizeDisabled()` leaves the upload
+    // unfinalized until `DeleteResumableUpload` cancels it on `live_client`.
   }
+  ASSERT_THAT(live_client->DeleteResumableUpload(session_id), IsOk());
   {
-    StatusOr<gcs::Client> client = MakeUdsStorageClient(
+    std::unique_lock<std::mutex> lk(fake_.mu);
+    ASSERT_TRUE(fake_.cv.wait_for(lk, std::chrono::seconds(2),
+                                  [&] { return fake_.aborted_writes >= 1; }));
+  }
+
+  {
+    StatusOr<gcs::Client> temp_client = MakeUdsStorageClient(
         CoreOpts(), Options{}.set<gcs::UploadBufferSizeOption>(256 * 1024));
-    ASSERT_THAT(client, IsOk());
-    gcs::ObjectWriteStream stream = client->WriteObject("bkt", "abandoned-2");
+    ASSERT_THAT(temp_client, IsOk());
+    gcs::ObjectWriteStream stream =
+        temp_client->WriteObject("bkt", "abandoned-2");
     std::string const part(300 * 1024, 'q');
     stream.write(part.data(), static_cast<std::streamsize>(part.size()));
     std::move(stream).Suspend();
-    // Destroy `client` (and its `UdsStorageConnection`) without `Close()`.
+    // Destroy `temp_client` (and its `UdsStorageConnection`) without `Close()`.
   }
 
   std::unique_lock<std::mutex> lk(fake_.mu);
@@ -1476,6 +1479,139 @@ TEST_F(AdapterFakeTest, PeerCredentialPermissionDeniedFailsFast) {
   EXPECT_THAT(sync_client, StatusIsWithMessage(StatusCode::kPermissionDenied,
                                                "peer uid 65534"));
   EXPECT_LT(elapsed, std::chrono::seconds(2));
+}
+
+/// @test Boundary validation and unsupported option guards fail explicitly
+/// (`kInvalidArgument` for out-of-range integers, `kUnimplemented` for MD5 /
+/// precomputed checksums / non-`content_type` `WithObjectMetadata`) instead of
+/// silently truncating or dropping caller options.
+TEST_F(AdapterFakeTest, BoundaryAndUnsupportedOptions) {
+  fake_.objects["p.bin"] = "xyz";
+  StatusOr<gcs::Client> sync_client = MakeUdsStorageClient(CoreOpts());
+  StatusOr<gcs::AsyncClient> async_client = MakeUdsAsyncClient(CoreOpts());
+  ASSERT_THAT(sync_client, IsOk());
+  ASSERT_THAT(async_client, IsOk());
+
+  // Negative Generation and IfGenerationMatch are rejected across sync + async.
+  {
+    gcs::ObjectReadStream s =
+        sync_client->ReadObject("bkt", "p.bin", gcs::Generation(-1));
+    (void)std::string(std::istreambuf_iterator<char>(s), {});
+    EXPECT_THAT(s.status(), StatusIs(StatusCode::kInvalidArgument));
+  }
+  {
+    gcs::ObjectReadStream s =
+        sync_client->ReadObject("bkt", "p.bin", gcs::IfGenerationMatch(-1));
+    (void)std::string(std::istreambuf_iterator<char>(s), {});
+    EXPECT_THAT(s.status(), StatusIs(StatusCode::kInvalidArgument));
+  }
+  EXPECT_THAT(
+      sync_client->InsertObject("bkt", "x", "body", gcs::IfGenerationMatch(-1)),
+      StatusIs(StatusCode::kInvalidArgument));
+  {
+    gcs::ObjectWriteStream ws =
+        sync_client->WriteObject("bkt", "x", gcs::IfGenerationMatch(-1));
+    EXPECT_THAT(ws.last_status(), StatusIs(StatusCode::kInvalidArgument));
+  }
+  EXPECT_THAT(sync_client->DeleteObject("bkt", "p.bin", gcs::Generation(-1)),
+              StatusIs(StatusCode::kInvalidArgument));
+  EXPECT_THAT(
+      sync_client->DeleteObject("bkt", "p.bin", gcs::IfGenerationMatch(-1)),
+      StatusIs(StatusCode::kInvalidArgument));
+
+  {
+    google::storage::v2::BidiReadObjectSpec spec;
+    spec.set_bucket("projects/_/buckets/bkt");
+    spec.set_object("p.bin");
+    spec.set_generation(-1);
+    EXPECT_THAT(async_client->Open(spec).get(),
+                StatusIs(StatusCode::kInvalidArgument));
+  }
+  {
+    google::storage::v2::BidiReadObjectSpec spec;
+    spec.set_bucket("projects/_/buckets/bkt");
+    spec.set_object("p.bin");
+    spec.set_if_generation_match(0);
+    // `gcscore.v1.OpenObjectRequest` does not expose `if_generation_match`.
+    EXPECT_THAT(async_client->Open(spec).get(),
+                StatusIs(StatusCode::kUnimplemented));
+  }
+  {
+    google::storage::v2::BidiWriteObjectRequest req;
+    auto* wspec = req.mutable_write_object_spec();
+    wspec->mutable_resource()->set_bucket("projects/_/buckets/bkt");
+    wspec->mutable_resource()->set_name("x");
+    wspec->set_if_generation_match(-1);
+    EXPECT_THAT(async_client->StartAppendableObjectUpload(req).get(),
+                StatusIs(StatusCode::kInvalidArgument));
+  }
+  EXPECT_THAT(
+      async_client->DeleteObject(gcs::BucketName("bkt"), "p.bin", -1).get(),
+      StatusIs(StatusCode::kInvalidArgument));
+  {
+    google::storage::v2::DeleteObjectRequest req;
+    req.set_bucket("projects/_/buckets/bkt");
+    req.set_object("p.bin");
+    req.set_if_generation_match(-1);
+    EXPECT_THAT(async_client->DeleteObject(req).get(),
+                StatusIs(StatusCode::kInvalidArgument));
+  }
+
+  // Negative MaxResults and UploadContentLength > INT64_MAX fail cleanly.
+  {
+    auto reader = sync_client->ListObjects("bkt", gcs::MaxResults(-1));
+    EXPECT_THAT(*reader.begin(), StatusIs(StatusCode::kInvalidArgument));
+  }
+  {
+    auto reader =
+        sync_client->ListBucketsForProject("proj", gcs::MaxResults(-1));
+    EXPECT_THAT(*reader.begin(), StatusIs(StatusCode::kInvalidArgument));
+  }
+  {
+    constexpr std::uint64_t kTooLarge =
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) +
+        1ULL;
+    gcs::ObjectWriteStream ws = sync_client->WriteObject(
+        "bkt", "x", gcs::UploadContentLength(kTooLarge));
+    EXPECT_THAT(ws.last_status(), StatusIs(StatusCode::kInvalidArgument));
+  }
+
+  // Unsupported checksums and non-content_type ObjectMetadata fields return
+  // kUnimplemented rather than silently dropping integrity/metadata settings.
+  EXPECT_THAT(
+      MakeUdsStorageClient(CoreOpts(),
+                           Options{}.set<gcs::UploadChecksumValidationOption>(
+                               gcs::ChecksumAlgorithm::kMD5)),
+      StatusIs(StatusCode::kUnimplemented));
+  EXPECT_THAT(
+      MakeUdsStorageClient(CoreOpts(),
+                           Options{}.set<gcs::DownloadChecksumValidationOption>(
+                               gcs::ChecksumAlgorithm::kMD5)),
+      StatusIs(StatusCode::kUnimplemented));
+  EXPECT_THAT(MakeUdsStorageClient(
+                  CoreOpts(), Options{}.set<gcs::PrecomputedChecksumsOption>(
+                                  gcs::PrecomputedChecksums{"AAAAAA==", ""})),
+              StatusIs(StatusCode::kUnimplemented));
+
+  EXPECT_THAT(sync_client->InsertObject(
+                  "bkt", "x", "body",
+                  gcs::WithObjectMetadata(
+                      gcs::ObjectMetadata().set_cache_control("no-cache"))),
+              StatusIs(StatusCode::kUnimplemented));
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+  EXPECT_THAT(sync_client->InsertObject("bkt", "x", "body",
+                                        gcs::Crc32cChecksumValue("AAAAAA==")),
+              StatusIs(StatusCode::kUnimplemented));
+  EXPECT_THAT(
+      sync_client->InsertObject("bkt", "x", "body",
+                                gcs::MD5HashValue("1B2M2Y8AsgTpgAmY7PhCfg==")),
+      StatusIs(StatusCode::kUnimplemented));
+  EXPECT_THAT(
+      sync_client->InsertObject("bkt", "x", "body", gcs::EnableMD5Hash()),
+      StatusIs(StatusCode::kUnimplemented));
+#pragma GCC diagnostic pop
 }
 
 }  // namespace

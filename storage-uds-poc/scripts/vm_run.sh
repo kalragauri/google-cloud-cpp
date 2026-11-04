@@ -38,6 +38,7 @@ REGIONAL="${REGIONAL:?REGIONAL bucket must be set}"
 ZONAL="${ZONAL:?ZONAL bucket must be set}"
 BUCKET_PREFIX="${BUCKET_PREFIX:?BUCKET_PREFIX must be set}"
 ALLOW_REGIONAL_BIDI="${ALLOW_REGIONAL_BIDI:-0}"
+WORKER_THREADS="${WORKER_THREADS:-0}"
 POC="${POC:-$HOME/poc/src/storage-uds-poc}"
 BUILD="$POC/cmake-out"
 RUN="${RUN:-$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -70,7 +71,7 @@ CPP_SHA="$(git -C "$POC/.." rev-parse HEAD 2>/dev/null || echo unknown)"
 
 {
   echo "host=$(hostname) project=$PROJECT instance_id=$INSTANCE_ID zone=$ZONE machine=$MACHINE cpus=$(nproc)"
-  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX start=$(date -u +%FT%TZ)"
+  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX worker_threads=$WORKER_THREADS start=$(date -u +%FT%TZ)"
   echo "ops_agent=$(systemctl is-active google-cloud-ops-agent)"
   echo "cpp_sha=$CPP_SHA rust_sha=$RUST_SHA"
   echo "kernel=$(uname -r) glibc=$(ldd --version | head -1 | awk '{print $NF}')"
@@ -141,6 +142,7 @@ run_cell() {
   python3 "$VERIFY" "$name.path.json" -- \
     "$BENCH" --mode="$mode" \
     --warmup-secs="$WARMUP" \
+    --worker-threads="$WORKER_THREADS" \
     --out="$name.csv" \
     --summary-json="$name.summary.json" \
     "$@" >"$name.log" 2>&1
