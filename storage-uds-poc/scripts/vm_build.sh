@@ -43,22 +43,29 @@ gcloud storage cp "gs://$OPS/$SRC_TGZ" "$ROOT/src.tgz"
 tar -C "$ROOT/src" -xzf "$ROOT/src.tgz"
 POC="$ROOT/src/storage-uds-poc"
 
-# --- C++ (wrapper, tests, quickstart, ssb_uds, ssb_native) -----------------------
+# --- C++ configure (installs the vcpkg dependencies, including protoc) -----------
+export PATH="$HOME/.cargo/bin:$PATH"
 /usr/bin/time -f 'cpp configure wall=%es' cmake -S "$POC" -B "$POC/cmake-out" -GNinja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake"
-/usr/bin/time -f 'cpp build wall=%es' cmake --build "$POC/cmake-out" -j"$(nproc)" \
-  --target gcs_core gcs_core_test quickstart ssb_uds ssb_native
 
-# --- Rust (sidecar + pure-rust bench); protoc from the vcpkg tree ---------------
+# --- Rust first (sidecar, pure-rust bench, libgcs_core.a); protoc from vcpkg ------
+# The C++ build's cargo step would do the same; running it here times it.
 export PROTOC="$POC/cmake-out/vcpkg_installed/x64-linux/tools/protobuf/protoc"
 (cd "$POC/sidecar" && /usr/bin/time -f 'rust build wall=%es' \
   "$HOME/.cargo/bin/cargo" build --release)
 
+# --- C++: both wrapper variants, tests, quickstarts, three benchmarks -------------
+/usr/bin/time -f 'cpp build wall=%es' cmake --build "$POC/cmake-out" -j"$(nproc)" \
+  --target gcs_core gcs_core_inproc gcs_core_test gcs_core_inproc_test \
+           quickstart quickstart_inproc ssb_uds ssb_inproc ssb_native
+
 # --- tests ------------------------------------------------------------------------
 (cd "$POC/sidecar" && "$HOME/.cargo/bin/cargo" test --release)
 GCS_CORE_SIDECAR="$POC/sidecar/target/release/gcs-core-sidecar" "$POC/cmake-out/gcs_core_test"
+"$POC/cmake-out/gcs_core_inproc_test"
 
-ls -la "$POC/cmake-out/bench/ssb_uds" "$POC/cmake-out/bench/ssb_native" \
-  "$POC/sidecar/target/release/gcs-core-sidecar" "$POC/sidecar/target/release/gcs-core-bench"
+ls -la "$POC/cmake-out/bench/ssb_uds" "$POC/cmake-out/bench/ssb_inproc" "$POC/cmake-out/bench/ssb_native" \
+  "$POC/sidecar/target/release/gcs-core-sidecar" "$POC/sidecar/target/release/gcs-core-bench" \
+  "$POC/sidecar/target/release/libgcs_core.a"
 echo BUILD_OK

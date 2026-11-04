@@ -30,10 +30,15 @@ namespace {
 std::atomic<std::uint64_t> g_malloc_bytes{0};
 std::atomic<std::uint64_t> g_malloc_calls{0};
 std::atomic<std::uint64_t> g_new_bytes{0};
+std::atomic<std::uint64_t> g_core_bytes{0};
+// Plain initial-exec TLS in the executable: reading it inside malloc is a
+// fixed offset, never an allocation.
+thread_local bool t_core_thread = false;
 
 inline void count(std::size_t n) {
   g_malloc_bytes.fetch_add(n, std::memory_order_relaxed);
   g_malloc_calls.fetch_add(1, std::memory_order_relaxed);
+  if (t_core_thread) g_core_bytes.fetch_add(n, std::memory_order_relaxed);
 }
 
 std::int64_t status_kib(char const* key) {
@@ -122,6 +127,10 @@ std::uint64_t malloc_calls() {
 std::uint64_t new_bytes() {
   return g_new_bytes.load(std::memory_order_relaxed);
 }
+std::uint64_t core_bytes() {
+  return g_core_bytes.load(std::memory_order_relaxed);
+}
+void MarkCoreThread(bool is_core) { t_core_thread = is_core; }
 std::int64_t rss_kib() { return status_kib("VmRSS:"); }
 std::int64_t peak_rss_kib() { return status_kib("VmHWM:"); }
 }  // namespace alloc_counter

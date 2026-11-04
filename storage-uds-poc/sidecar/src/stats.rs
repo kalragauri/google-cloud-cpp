@@ -23,79 +23,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Cumulative bytes requested from malloc and friends, never decremented, so
 /// a delta between two snapshots is the allocation volume of the work in
-/// between.
-///
-/// The libc allocation functions are interposed (as the C++ harness does),
-/// rather than counting at Rust's `GlobalAlloc`: the core also allocates from
-/// C code (aws-lc via `OPENSSL_malloc`), which never passes through Rust's
-/// allocator. Rust's default `System` allocator calls these symbols, so Rust
-/// allocations are counted too, exactly once.
+/// between. Fed by the binaries' `malloc_interpose` module; inside
+/// `libgcs_core` linked into a C++ program nothing feeds it and it stays 0 —
+/// the host's own interposer then counts for the whole process.
 static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// Records `n` requested bytes. Must not allocate: it runs inside `malloc`.
 #[inline]
-fn count(n: usize) {
+pub fn record_allocation(n: usize) {
     ALLOCATED_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-}
-
-// glibc's real implementations; exported with a stable ABI since 2.2.5.
-unsafe extern "C" {
-    fn __libc_malloc(size: usize) -> *mut libc::c_void;
-    fn __libc_calloc(n: usize, size: usize) -> *mut libc::c_void;
-    fn __libc_realloc(p: *mut libc::c_void, size: usize) -> *mut libc::c_void;
-    fn __libc_memalign(align: usize, size: usize) -> *mut libc::c_void;
-    fn __libc_free(p: *mut libc::c_void);
-}
-
-// SAFETY (all functions below): each forwards to the glibc implementation
-// with the same contract; only a counter is updated, which allocates nothing.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn malloc(size: usize) -> *mut libc::c_void {
-    count(size);
-    unsafe { __libc_malloc(size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn calloc(n: usize, size: usize) -> *mut libc::c_void {
-    count(n.saturating_mul(size));
-    unsafe { __libc_calloc(n, size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn realloc(p: *mut libc::c_void, size: usize) -> *mut libc::c_void {
-    count(size);
-    unsafe { __libc_realloc(p, size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn free(p: *mut libc::c_void) {
-    unsafe { __libc_free(p) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memalign(align: usize, size: usize) -> *mut libc::c_void {
-    count(size);
-    unsafe { __libc_memalign(align, size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn aligned_alloc(align: usize, size: usize) -> *mut libc::c_void {
-    count(size);
-    unsafe { __libc_memalign(align, size) }
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn posix_memalign(
-    out: *mut *mut libc::c_void,
-    align: usize,
-    size: usize,
-) -> libc::c_int {
-    count(size);
-    let p = unsafe { __libc_memalign(align, size) };
-    if p.is_null() {
-        return libc::ENOMEM;
-    }
-    unsafe { *out = p };
-    0
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -197,16 +133,5 @@ mod tests {
         let s = snapshot();
         assert!(s.rss_bytes > 0);
         assert!(s.threads >= 1);
-    }
-
-    /// Rust heap allocations go through the interposed malloc, so a 1 MiB
-    /// Vec moves the counter by at least 1 MiB.
-    #[test]
-    fn rust_allocations_are_counted() {
-        let before = snapshot().allocated_bytes;
-        let v = std::hint::black_box(vec![1_u8; 1 << 20]);
-        let after = snapshot().allocated_bytes;
-        assert!(after - before >= 1 << 20, "delta={}", after - before);
-        drop(v);
     }
 }

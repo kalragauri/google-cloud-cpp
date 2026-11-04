@@ -37,6 +37,13 @@ namespace alloc_counter {
 std::uint64_t malloc_bytes();
 std::uint64_t malloc_calls();
 std::uint64_t new_bytes();
+/// Bytes requested from malloc and friends on threads marked as core threads
+/// (a subset of malloc_bytes()). Lets a single-process benchmark attribute
+/// allocations to the core the way a two-process one reads them from the
+/// sidecar.
+std::uint64_t core_bytes();
+/// Marks or unmarks the calling thread as a core thread for core_bytes().
+void MarkCoreThread(bool is_core);
 /// Current / peak resident set size of the process in KiB (/proc/self/status).
 std::int64_t rss_kib();
 std::int64_t peak_rss_kib();

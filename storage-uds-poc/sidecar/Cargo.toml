@@ -4,10 +4,17 @@ version     = "0.1.0"
 edition     = "2024"
 publish     = false
 license     = "Apache-2.0"
-description = "POC: Rust core-sdk sidecar serving gcs.core.v0.StorageCore over a Unix domain socket"
+description = "POC: Rust core-sdk serving gcs.core.v0.StorageCore, as a Unix-socket sidecar or in-process"
 
 # Standalone package: never part of a parent workspace.
 [workspace]
+
+# The core itself: `rlib` for the two binaries below, `staticlib` for the
+# in-process variant linked into the C++ wrapper (`libgcs_core.a`).
+[lib]
+name       = "gcs_core"
+path       = "src/lib.rs"
+crate-type = ["rlib", "staticlib"]
 
 [[bin]]
 name = "gcs-core-sidecar"

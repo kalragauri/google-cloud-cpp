@@ -18,13 +18,16 @@
 #
 #   PHASE=smoke       2 iterations of every cell, default flags first
 #   PHASE=full        the measured matrix
-#   PHASE=supplement  supplementary Cloudpath pass (uds-ch4, pure-rust-unbuffered,
-#                     pure-upload THROUGHPUT-WRITE)
+#   PHASE=supplement  supplementary Cloudpath pass (uds-ch4, inproc-ch4,
+#                     pure-rust-unbuffered, pure-upload THROUGHPUT-WRITE)
 #   ITER              iterations per cell in full/supplement (default 200)
 #
 # Rules enforced here: implementations run one at a time, in rotating order
 # per cell; every run goes through verify_path.py (Cloudpath only); the
-# sidecar and the pure-Rust core both use 4 gRPC subchannels, like native.
+# sidecar, the in-process core and the pure-Rust core all use 4 gRPC
+# subchannels, like native. `inproc` (core on threads of the benchmark
+# process) runs next to `uds` (core in a sidecar process) in every cell with
+# the same core arguments, so the pair isolates the process boundary.
 set -uo pipefail
 OPS="${OPS:-kalragauri-uds-poc-ops}"
 PHASE="${PHASE:-smoke}"
@@ -39,6 +42,7 @@ cd "$OUT"
 
 export GCS_CORE_SIDECAR="$POC/sidecar/target/release/gcs-core-sidecar"
 UDS="$POC/cmake-out/bench/ssb_uds"
+INPROC="$POC/cmake-out/bench/ssb_inproc"
 NATIVE="$POC/cmake-out/bench/ssb_native"
 RUST="$POC/sidecar/target/release/gcs-core-bench"
 # Scripts can be updated without rebuilding: fetch the current copies.
@@ -67,6 +71,25 @@ run() {
   gcloud storage cp --quiet "$name".* "gs://$OPS/results/$RUN/" >/dev/null 2>&1
 }
 
+# run_impl PREFIX IMPL ARGS... : one verified run of implementation IMPL
+# (uds, uds-ch4, inproc, inproc-ch4, rust, rust-unbuffered, native,
+# native-<sync>) named PREFIX-IMPL. The one place that maps an implementation
+# to its binary and flags, so every cell runs each implementation the same way.
+run_impl() {
+  local prefix=$1 impl=$2; shift 2
+  case $impl in
+    uds)             run "$prefix-$impl" "$UDS" "$@" "${SIDECAR_ARGS[@]}" ;;
+    uds-ch4)         run "$prefix-$impl" "$UDS" "$@" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
+    inproc)          run "$prefix-$impl" "$INPROC" "$@" "${SIDECAR_ARGS[@]}" ;;
+    inproc-ch4)      run "$prefix-$impl" "$INPROC" "$@" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
+    rust)            run "$prefix-$impl" "$RUST" "$@" ;;
+    rust-unbuffered) run "$prefix-$impl" "$RUST" "$@" --unbuffered --label=unbuffered ;;
+    native)          run "$prefix-$impl" "$NATIVE" "$@" --sync=grpc-cfe ;;
+    native-*)        run "$prefix-$impl" "$NATIVE" "$@" --sync="${impl#native-}" ;;
+    *) echo "run_impl: unknown implementation $impl" >&2; FAILED=$((FAILED + 1)) ;;
+  esac
+}
+
 # rotate N ITEMS... : prints ITEMS rotated left by N (ordering-bias control).
 rotate() { local n=$1; shift; local a=("$@"); local k=$((n % ${#a[@]})); echo "${a[@]:k}" "${a[@]:0:k}"; }
 
@@ -75,6 +98,7 @@ if [[ "$PHASE" == "smoke" ]]; then
   SIZES=(100000)
   # Default flags first (no overrides), then the configured variants.
   run smoke-default-uds "$UDS" --bucket="$REGIONAL" --iterations=$ITER
+  run smoke-default-inproc "$INPROC" --bucket="$REGIONAL" --iterations=$ITER
   run smoke-default-native "$NATIVE" --bucket="$REGIONAL" --iterations=$ITER
   run smoke-default-rust "$RUST" --bucket="$REGIONAL" --iterations=$ITER
 elif [[ "$PHASE" == "supplement" ]]; then
@@ -87,20 +111,15 @@ fi
 k=0
 for size in "${SIZES[@]}"; do
   if [[ "$PHASE" == "supplement" ]]; then
-    w1r3_impls=(uds native-json-h1 rust rust-unbuffered)
+    w1r3_impls=(uds inproc native-json-h1 rust rust-unbuffered)
   elif (( size == 100000000 )); then
-    w1r3_impls=(uds native-json-h1 native-json-default native-grpc-cfe rust rust-unbuffered)
+    w1r3_impls=(uds inproc native-json-h1 native-json-default native-grpc-cfe rust rust-unbuffered)
   else
-    w1r3_impls=(uds native-json-h1 native-json-default native-grpc-cfe rust)
+    w1r3_impls=(uds inproc native-json-h1 native-json-default native-grpc-cfe rust)
   fi
   for impl in $(rotate $k "${w1r3_impls[@]}"); do
     common=(--bucket="$REGIONAL" --workload=w1r3 --iterations="$ITER" --object-sizes="$size")
-    case $impl in
-      uds) run "w1r3-$size-uds" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" ;;
-      rust) run "w1r3-$size-rust" "$RUST" "${common[@]}" ;;
-      rust-unbuffered) run "w1r3-$size-rust-unbuffered" "$RUST" "${common[@]}" --unbuffered --label=unbuffered ;;
-      native-*) run "w1r3-$size-$impl" "$NATIVE" "${common[@]}" --sync="${impl#native-}" ;;
-    esac
+    run_impl "w1r3-$size" "$impl" "${common[@]}"
   done
   k=$((k + 1))
 done
@@ -110,13 +129,9 @@ if [[ "$PHASE" != "supplement" ]]; then
   LIST_ITER=100; [[ $PHASE == smoke ]] && LIST_ITER=2
   for bucket_type in regional zonal; do
     bucket=$REGIONAL; [[ $bucket_type == zonal ]] && bucket=$ZONAL
-    for impl in $(rotate $k uds native-grpc-cfe rust native-json-h1); do
+    for impl in $(rotate $k uds inproc native-grpc-cfe rust native-json-h1); do
       common=(--bucket="$bucket" --bucket-type=$bucket_type --workload=list --iterations="$LIST_ITER")
-      case $impl in
-        uds) run "list-$bucket_type-uds" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" ;;
-        rust) run "list-$bucket_type-rust" "$RUST" "${common[@]}" ;;
-        native-*) run "list-$bucket_type-$impl" "$NATIVE" "${common[@]}" --sync="${impl#native-}" ;;
-      esac
+      run_impl "list-$bucket_type" "$impl" "${common[@]}"
     done
     k=$((k + 1))
   done
@@ -130,13 +145,9 @@ if [[ "$PHASE" != "supplement" ]]; then
     for w in open random8k read50x2x4 appendable; do
       [[ $bucket_type == regional && $w == appendable ]] && continue
       witer=$it; [[ $w == read50x2x4 && $PHASE == full && $bucket_type == zonal ]] && witer=$(( ITER / 2 ))
-      for impl in $(rotate $k uds native rust); do
+      for impl in $(rotate $k uds inproc native rust); do
         common=(--bucket="$bucket" --bucket-type=$bucket_type --workload=$w --iterations="$witer" --object-sizes="$(IFS=,; echo "${SIZES[*]}")")
-        case $impl in
-          uds) run "$w-$bucket_type-uds" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" ;;
-          rust) run "$w-$bucket_type-rust" "$RUST" "${common[@]}" ;;
-          native) run "$w-$bucket_type-native" "$NATIVE" "${common[@]}" --sync=grpc-cfe ;;
-        esac
+        run_impl "$w-$bucket_type" "$impl" "${common[@]}"
       done
       k=$((k + 1))
     done
@@ -150,47 +161,54 @@ for workers in 8 32; do
   for op in read write; do
     # Regional JSON
     if [[ "$op" == "write" ]]; then
-      tp_json_impls=(uds uds-ch4 native-json-h1 rust rust-unbuffered)
+      tp_json_impls=(uds uds-ch4 inproc inproc-ch4 native-json-h1 rust rust-unbuffered)
     else
-      tp_json_impls=(uds uds-ch4 native-json-h1 rust)
+      tp_json_impls=(uds uds-ch4 inproc inproc-ch4 native-json-h1 rust)
     fi
     for impl in $(rotate $k "${tp_json_impls[@]}"); do
       common=(--bucket="$REGIONAL" --workload=throughput --throughput-op=$op --workers=$workers --iterations=$TP_ITER --object-sizes=100000000)
-      case $impl in
-        uds) run "tp-json-$op-w$workers-uds" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" ;;
-        uds-ch4) run "tp-json-$op-w$workers-uds-ch4" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
-        rust) run "tp-json-$op-w$workers-rust" "$RUST" "${common[@]}" ;;
-        rust-unbuffered) run "tp-json-$op-w$workers-rust-unbuffered" "$RUST" "${common[@]}" --unbuffered --label=unbuffered ;;
-        native-*) run "tp-json-$op-w$workers-$impl" "$NATIVE" "${common[@]}" --sync="${impl#native-}" ;;
-      esac
+      run_impl "tp-json-$op-w$workers" "$impl" "${common[@]}"
     done
     # Zonal bidi
-    for impl in $(rotate $k uds uds-ch4 native rust); do
+    for impl in $(rotate $k uds uds-ch4 inproc inproc-ch4 native rust); do
       common=(--bucket="$ZONAL" --bucket-type=zonal --workload=throughput --throughput-op=$op --workers=$workers --iterations=$TP_ITER --object-sizes=100000000)
-      case $impl in
-        uds) run "tp-bidi-$op-w$workers-uds" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" ;;
-        uds-ch4) run "tp-bidi-$op-w$workers-uds-ch4" "$UDS" "${common[@]}" "${SIDECAR_ARGS[@]}" --channels=4 --label=ch4 ;;
-        rust) run "tp-bidi-$op-w$workers-rust" "$RUST" "${common[@]}" ;;
-        native) run "tp-bidi-$op-w$workers-native" "$NATIVE" "${common[@]}" --sync=grpc-cfe ;;
-      esac
+      run_impl "tp-bidi-$op-w$workers" "$impl" "${common[@]}"
     done
     k=$((k + 1))
   done
 done
 
 if [[ "$PHASE" != "supplement" ]]; then
-  # --- Hop floor: synthetic sidecar (no GCS) ------------------------------------
+  # --- Hop floor: synthetic core (no GCS), both boundaries ----------------------
+  # Same chunk × channels sweep for the sidecar and the in-process core; the
+  # abstract-socket link runs at the default chunk only, as a control for the
+  # channel type (descriptor "direct" channel vs. the resolver-based channel
+  # `uds` uses).
   SYN_ITER=50; SYN_TP_ITER=10
   [[ $PHASE == smoke ]] && SYN_ITER=2 && SYN_TP_ITER=1
   for chunk in 262144 1048576 4194304; do
     for channels in 1 4; do
-      run "synthetic-w1r3-c$chunk-ch$channels" "$UDS" --bucket=synthetic --workload=w1r3 \
-        --iterations=$SYN_ITER --object-sizes=100000,2097152,100000000 --label=synthetic \
-        --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
-      run "synthetic-tp-c$chunk-ch$channels" "$UDS" --bucket=synthetic --workload=throughput \
-        --workers=32 --iterations=$SYN_TP_ITER --object-sizes=100000000 --label=synthetic \
-        --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
+      for impl in $(rotate $k uds inproc); do
+        bin=$UDS; [[ $impl == inproc ]] && bin=$INPROC
+        run "synthetic-w1r3-c$chunk-ch$channels-$impl" "$bin" --bucket=synthetic --workload=w1r3 \
+          --iterations=$SYN_ITER --object-sizes=100000,2097152,100000000 --label=synthetic \
+          --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
+        run "synthetic-tp-c$chunk-ch$channels-$impl" "$bin" --bucket=synthetic --workload=throughput \
+          --workers=32 --iterations=$SYN_TP_ITER --object-sizes=100000000 --label=synthetic \
+          --channels=$channels --chunk-size=$chunk --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=$chunk
+      done
+      k=$((k + 1))
     done
+  done
+  for channels in 1 4; do
+    run "synthetic-w1r3-c1048576-ch$channels-inproc-abstract" "$INPROC" --bucket=synthetic --workload=w1r3 \
+      --iterations=$SYN_ITER --object-sizes=100000,2097152,100000000 --label=synthetic-abstract \
+      --channels=$channels --chunk-size=1048576 --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=1048576 \
+      --sidecar-arg=--link=abstract
+    run "synthetic-tp-c1048576-ch$channels-inproc-abstract" "$INPROC" --bucket=synthetic --workload=throughput \
+      --workers=32 --iterations=$SYN_TP_ITER --object-sizes=100000000 --label=synthetic-abstract \
+      --channels=$channels --chunk-size=1048576 --sidecar-arg=--synthetic --sidecar-arg=--chunk-size=1048576 \
+      --sidecar-arg=--link=abstract
   done
 fi
 

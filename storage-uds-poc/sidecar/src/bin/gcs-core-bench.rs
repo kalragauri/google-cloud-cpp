@@ -18,8 +18,10 @@
 //! wrapper + UDS hop. Measurement matches the C++ harness: getrusage(SELF),
 //! interposed malloc, /proc RSS. CSV schema is identical (peer columns 0).
 
-#[path = "../stats.rs"]
-mod stats;
+#[path = "../malloc_interpose.rs"]
+mod malloc_interpose;
+
+use gcs_core::stats;
 
 use bytes::Bytes;
 use google_cloud_storage::client::{Storage, StorageControl};

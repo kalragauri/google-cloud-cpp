@@ -12,8 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GCS SDK consolidation POC: thin C++ wrapper over a Rust core-sdk sidecar
-# (gRPC over a Unix domain socket), plus the native google-cloud-cpp baseline.
+# GCS SDK consolidation POC: thin C++ wrapper over a Rust core-sdk, built in
+# two variants that differ only in where the core runs — a sidecar process
+# reached over a Unix domain socket (`gcs_core`) or tokio threads inside the
+# application reached over socket pairs (`gcs_core_inproc`) — plus the native
+# google-cloud-cpp baseline.
 #
 # This is a standalone project. It is NOT referenced by the repository's root
 # CMakeLists.txt, so it never affects the library build or its CI.
@@ -39,7 +42,15 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# The POC's own sources build warning-free; the google-cloud-cpp subdirectory
+# and the generated protos keep their own flags.
+function (gcs_uds_poc_warnings target)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Werror)
+endfunction ()
+
 option(GCS_UDS_POC_BUILD_TESTS "Build the wrapper unit tests" ON)
+option(GCS_UDS_POC_BUILD_INPROC
+       "Build the in-process variant (needs cargo; see sidecar/)" ON)
 
 # google-cloud-cpp from this checkout: `common` for the wrapper, `storage` and
 # `storage_grpc` for the native baseline. EXCLUDE_FROM_ALL builds only what is
@@ -81,32 +92,89 @@ target_include_directories(gcs_core_protos SYSTEM
 target_link_libraries(gcs_core_protos PUBLIC gRPC::grpc++
                                              protobuf::libprotobuf)
 
-# --- the thin wrapper ---------------------------------------------------------
-add_library(
-    gcs_core
-    cpp/include/gcs_core/client.h
-    cpp/src/client.cc
-    cpp/src/sidecar_process.cc
-    cpp/src/sidecar_process.h
-    cpp/src/status.cc
-    cpp/src/status.h)
+# --- the thin wrapper, sidecar variant -----------------------------------------
+# Everything above the backend seam (`cpp/src/core_backend.h`) is the same
+# source in both variants; only the backend translation unit differs.
+set(GCS_CORE_WRAPPER_SOURCES cpp/include/gcs_core/client.h cpp/src/client.cc
+                             cpp/src/core_backend.h cpp/src/status.cc
+                             cpp/src/status.h)
+add_library(gcs_core ${GCS_CORE_WRAPPER_SOURCES} cpp/src/sidecar_backend.cc
+                     cpp/src/sidecar_process.cc cpp/src/sidecar_process.h)
 target_include_directories(gcs_core PUBLIC cpp/include PRIVATE cpp/src)
 target_link_libraries(
     gcs_core
     PUBLIC absl::cord absl::status absl::strings google-cloud-cpp::common
     PRIVATE gRPC::grpc++ gcs_core_protos)
+gcs_uds_poc_warnings(gcs_core)
 
 add_executable(quickstart cpp/examples/quickstart.cc)
 target_link_libraries(quickstart PRIVATE gcs_core)
+gcs_uds_poc_warnings(quickstart)
+# Cold start of Client::Create() in a fresh process (packaging probes).
+add_executable(cold_start cpp/examples/cold_start.cc)
+target_link_libraries(cold_start PRIVATE gcs_core)
+gcs_uds_poc_warnings(cold_start)
+
+# --- the Rust core as a static library, and the in-process variant ------------
+# One `cargo build` produces the sidecar binary, the pure-Rust comparator and
+# `libgcs_core.a`; cargo tracks its own inputs, so the target runs every build
+# and is a no-op when nothing changed. `protoc` comes from the vcpkg tree.
+if (GCS_UDS_POC_BUILD_INPROC)
+    find_program(GCS_UDS_POC_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin"
+                 REQUIRED)
+    set(GCS_UDS_POC_CARGO_DIR "${CMAKE_CURRENT_LIST_DIR}/sidecar")
+    set(GCS_UDS_POC_RUST_STATICLIB
+        "${GCS_UDS_POC_CARGO_DIR}/target/release/libgcs_core.a")
+    add_custom_target(
+        gcs_core_rust ALL
+        COMMAND ${CMAKE_COMMAND} -E env PROTOC=$<TARGET_FILE:protobuf::protoc>
+                ${GCS_UDS_POC_CARGO} build --release --quiet
+        WORKING_DIRECTORY "${GCS_UDS_POC_CARGO_DIR}"
+        BYPRODUCTS "${GCS_UDS_POC_RUST_STATICLIB}"
+        COMMENT "cargo build --release (sidecar, gcs-core-bench, libgcs_core.a)"
+        VERBATIM)
+    add_library(gcs_core_rust_lib STATIC IMPORTED)
+    set_target_properties(
+        gcs_core_rust_lib PROPERTIES IMPORTED_LOCATION
+                                     "${GCS_UDS_POC_RUST_STATICLIB}")
+    # From `rustc --print native-static-libs` for this crate.
+    target_link_libraries(gcs_core_rust_lib INTERFACE gcc_s util rt pthread m
+                                                      dl)
+    add_dependencies(gcs_core_rust_lib gcs_core_rust)
+
+    add_library(gcs_core_inproc ${GCS_CORE_WRAPPER_SOURCES}
+                                cpp/include/gcs_core/inproc.h
+                                cpp/src/gcs_core_inproc.h
+                                cpp/src/inproc_backend.cc)
+    target_include_directories(gcs_core_inproc PUBLIC cpp/include
+                               PRIVATE cpp/src)
+    target_link_libraries(
+        gcs_core_inproc
+        PUBLIC absl::cord absl::status absl::strings google-cloud-cpp::common
+        PRIVATE gRPC::grpc++ gcs_core_protos gcs_core_rust_lib)
+    gcs_uds_poc_warnings(gcs_core_inproc)
+
+    add_executable(quickstart_inproc cpp/examples/quickstart.cc)
+    target_link_libraries(quickstart_inproc PRIVATE gcs_core_inproc)
+    gcs_uds_poc_warnings(quickstart_inproc)
+    add_executable(cold_start_inproc cpp/examples/cold_start.cc)
+    target_link_libraries(cold_start_inproc PRIVATE gcs_core_inproc)
+    gcs_uds_poc_warnings(cold_start_inproc)
+endif ()
 
 if (GCS_UDS_POC_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
     enable_testing()
-    add_executable(gcs_core_test cpp/tests/client_test.cc
-                                 cpp/tests/sidecar_process_test.cc)
+    # The shared tests are compiled once per variant; `test_support.h` picks
+    # the few expectations that legitimately differ.
+    add_executable(gcs_core_test cpp/tests/client_common_test.cc
+                                 cpp/tests/client_sidecar_test.cc
+                                 cpp/tests/sidecar_process_test.cc
+                                 cpp/tests/test_support.h)
     target_include_directories(gcs_core_test PRIVATE cpp/src)
     target_link_libraries(gcs_core_test PRIVATE GTest::gmock_main gcs_core
                                                 gcs_core_protos)
+    gcs_uds_poc_warnings(gcs_core_test)
     add_test(NAME gcs_core_test COMMAND gcs_core_test)
     # The tests start the real sidecar in --synthetic mode.
     set_tests_properties(
@@ -115,6 +183,19 @@ if (GCS_UDS_POC_BUILD_TESTS)
             ENVIRONMENT
             "GCS_CORE_SIDECAR=${CMAKE_CURRENT_LIST_DIR}/sidecar/target/release/gcs-core-sidecar"
     )
+    if (GCS_UDS_POC_BUILD_INPROC)
+        add_executable(gcs_core_inproc_test cpp/tests/client_common_test.cc
+                                            cpp/tests/client_inproc_test.cc
+                                            cpp/tests/test_support.h)
+        target_compile_definitions(gcs_core_inproc_test
+                                   PRIVATE GCS_CORE_TEST_INPROC=1)
+        target_include_directories(gcs_core_inproc_test PRIVATE cpp/src)
+        target_link_libraries(gcs_core_inproc_test
+                              PRIVATE GTest::gmock_main gcs_core_inproc
+                                      gcs_core_protos)
+        gcs_uds_poc_warnings(gcs_core_inproc_test)
+        add_test(NAME gcs_core_inproc_test COMMAND gcs_core_inproc_test)
+    endif ()
 endif ()
 
 # --- benchmarks -----------------------------------------------------------------

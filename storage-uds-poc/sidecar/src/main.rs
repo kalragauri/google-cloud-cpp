@@ -17,18 +17,17 @@
 //! Lifetime: exits on the `Shutdown` RPC, on SIGTERM/SIGINT, or when the
 //! parent closes the pipe passed via `--parent-fd`, so a crashed parent
 //! never leaves the sidecar behind.
+//!
+//! The service, its configuration and the server settings come from the
+//! `gcs_core` library, which the in-process variant links into C++ instead.
 
-mod convert;
-mod service;
-mod stats;
-
-pub mod pb {
-    tonic::include_proto!("gcs.core.v0");
-}
+#[path = "malloc_interpose.rs"]
+mod malloc_interpose;
 
 use futures::StreamExt;
+use gcs_core::config::{self, Args, Mode};
+use gcs_core::{service, transport};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
@@ -36,112 +35,11 @@ use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tokio_stream::wrappers::UnixListenerStream;
 
-/// gRPC message limit on both directions; above `service::MAX_CHUNK` plus
-/// protobuf framing.
-const MAX_MESSAGE: usize = 2 * service::MAX_CHUNK;
-/// HTTP/2 initial window bounds enforced by `hyper` / `h2` (`65,535`..=`2^31 - 1`).
-const MIN_H2_WINDOW: u32 = 65_535;
-const MAX_H2_WINDOW: u32 = 0x7fff_ffff;
-
-#[derive(Debug, PartialEq)]
-struct Args {
-    socket: PathBuf,
-    parent_fd: Option<i32>,
-    synthetic: bool,
-    chunk_size: usize,
-    coalesce_reads: bool,
-    grpc_subchannels: Option<usize>,
-    worker_threads: Option<usize>,
-    stream_window: u32,
-    connection_window: u32,
-}
-
-const USAGE: &str = "usage: gcs-core-sidecar --socket=PATH [--parent-fd=N] [--synthetic] \
-[--chunk-size=BYTES (1048576)] [--no-coalesce-reads] [--grpc-subchannels=N] \
-[--worker-threads=N] [--stream-window=BYTES (8388608)] [--connection-window=BYTES (16777216)]";
-
-fn parse_args(argv: impl IntoIterator<Item = String>) -> Result<Args, String> {
-    let mut socket = None;
-    let mut args = Args {
-        socket: PathBuf::new(),
-        parent_fd: None,
-        synthetic: false,
-        chunk_size: 1 << 20,
-        coalesce_reads: true,
-        grpc_subchannels: None,
-        worker_threads: None,
-        stream_window: 8 << 20,
-        connection_window: 16 << 20,
-    };
-    fn num<T: std::str::FromStr>(key: &str, value: Option<&str>) -> Result<T, String> {
-        value
-            .and_then(|v| v.parse().ok())
-            .ok_or_else(|| format!("{key} needs a numeric value"))
-    }
-    for arg in argv {
-        let (key, value) = match arg.split_once('=') {
-            Some((k, v)) => (k.to_string(), Some(v.to_string())),
-            None => (arg.clone(), None),
-        };
-        let value = value.as_deref();
-        match key.as_str() {
-            "--socket" => socket = value.map(PathBuf::from),
-            "--parent-fd" => {
-                let fd: i32 = num(&key, value)?;
-                if fd <= 2 {
-                    return Err("--parent-fd must be > 2".to_string());
-                }
-                args.parent_fd = Some(fd);
-            }
-            "--synthetic" => args.synthetic = true,
-            "--chunk-size" => args.chunk_size = num(&key, value)?,
-            "--no-coalesce-reads" => args.coalesce_reads = false,
-            "--grpc-subchannels" => {
-                let n: usize = num(&key, value)?;
-                if n == 0 {
-                    return Err("--grpc-subchannels must be >= 1".to_string());
-                }
-                args.grpc_subchannels = Some(n);
-            }
-            "--worker-threads" => {
-                let n: usize = num(&key, value)?;
-                if n == 0 {
-                    return Err("--worker-threads must be >= 1".to_string());
-                }
-                args.worker_threads = Some(n);
-            }
-            "--stream-window" => args.stream_window = num(&key, value)?,
-            "--connection-window" => args.connection_window = num(&key, value)?,
-            _ => return Err(format!("unknown argument {arg}")),
-        }
-    }
-    args.socket = socket
-        .filter(|s| !s.as_os_str().is_empty())
-        .ok_or("--socket is required")?;
-    if args.chunk_size == 0 || args.chunk_size > service::MAX_CHUNK {
-        return Err(format!(
-            "--chunk-size must be in [1, {}]",
-            service::MAX_CHUNK
-        ));
-    }
-    for (flag, val) in [
-        ("--stream-window", args.stream_window),
-        ("--connection-window", args.connection_window),
-    ] {
-        if !(MIN_H2_WINDOW..=MAX_H2_WINDOW).contains(&val) {
-            return Err(format!(
-                "{flag} must be in [{MIN_H2_WINDOW}, {MAX_H2_WINDOW}]"
-            ));
-        }
-    }
-    Ok(args)
-}
-
 fn main() -> ExitCode {
-    let args = match parse_args(std::env::args().skip(1)) {
+    let args = match config::parse_args(Mode::Sidecar, std::env::args().skip(1)) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("gcs-core-sidecar: {e}\n{USAGE}");
+            eprintln!("gcs-core-sidecar: {e}\n{}", config::USAGE);
             return ExitCode::from(2);
         }
     };
@@ -165,53 +63,22 @@ fn main() -> ExitCode {
     }
 }
 
-async fn make_clients(args: &Args) -> Result<service::Clients, Box<dyn std::error::Error>> {
-    // Default endpoints only: the core is Cloudpath by construction.
-    let mut storage = google_cloud_storage::client::Storage::builder();
-    if let Some(n) = args.grpc_subchannels {
-        storage = storage.with_grpc_subchannel_count(n);
-    }
-    let storage = storage.build().await?;
-    let control = google_cloud_storage::client::StorageControl::builder()
-        .build()
-        .await?;
-    Ok(service::Clients { storage, control })
-}
-
-async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let socket = args
+        .socket
+        .clone()
+        .expect("parse_args requires --socket in sidecar mode");
     let clients = if args.synthetic {
         None
     } else {
-        Some(make_clients(&args).await?)
+        Some(service::Clients::build(args.grpc_subchannels).await?)
     };
     let shutdown = Arc::new(Notify::new());
-    let config = service::Config {
-        default_chunk: args.chunk_size,
-        coalesce_reads: args.coalesce_reads,
-    };
-    let svc = service::Service::new(clients, config, shutdown.clone());
+    let svc = service::Service::new(clients, args.service_config(), shutdown.clone());
 
-    let listener = bind(&args.socket)?;
-    // SAFETY: getuid has no preconditions and cannot fail.
-    let uid = unsafe { libc::getuid() };
-    let incoming = UnixListenerStream::new(listener).filter_map(move |conn| async move {
-        match conn {
-            // The socket is 0600 already; the peer check also covers sockets
-            // created in a directory with looser permissions.
-            Ok(stream) => match stream.peer_cred() {
-                Ok(cred) if cred.uid() == uid => Some(Ok(stream)),
-                Ok(cred) => {
-                    eprintln!(
-                        "gcs-core-sidecar: rejected connection from uid {}",
-                        cred.uid()
-                    );
-                    None
-                }
-                Err(e) => Some(Err(e)),
-            },
-            Err(e) => Some(Err(e)),
-        }
-    });
+    let listener = bind(&socket)?;
+    let incoming = UnixListenerStream::new(listener)
+        .filter_map(|conn| async move { transport::same_uid_only(conn) });
 
     if let Some(fd) = args.parent_fd {
         tokio::spawn(watch_parent(fd, shutdown.clone()));
@@ -220,21 +87,15 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!(
         "gcs-core-sidecar: listening on {} pid={} synthetic={} bidi={}",
-        args.socket.display(),
+        socket.display(),
         std::process::id(),
         args.synthetic,
         cfg!(google_cloud_unstable_storage_bidi)
     );
-    let server = pb::storage_core_server::StorageCoreServer::new(svc)
-        .max_decoding_message_size(MAX_MESSAGE)
-        .max_encoding_message_size(MAX_MESSAGE);
-    let result = tonic::transport::Server::builder()
-        .initial_stream_window_size(args.stream_window)
-        .initial_connection_window_size(args.connection_window)
-        .add_service(server)
+    let result = transport::router(svc, &args)
         .serve_with_incoming_shutdown(Box::pin(incoming), async move { shutdown.notified().await })
         .await;
-    let _ = std::fs::remove_file(&args.socket);
+    let _ = std::fs::remove_file(&socket);
     result?;
     Ok(())
 }
@@ -293,80 +154,6 @@ async fn watch_signals(shutdown: Arc<Notify>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn parse(v: &[&str]) -> Result<Args, String> {
-        parse_args(v.iter().map(|s| s.to_string()))
-    }
-
-    /// Defaults apply when only the socket is given.
-    #[test]
-    fn parse_defaults() {
-        let a = parse(&["--socket=/tmp/s.sock"]).unwrap();
-        assert_eq!(a.socket, PathBuf::from("/tmp/s.sock"));
-        assert_eq!(a.chunk_size, 1 << 20);
-        assert!(a.coalesce_reads);
-        assert!(!a.synthetic);
-        assert_eq!(a.parent_fd, None);
-    }
-
-    /// Every flag is honored.
-    #[test]
-    fn parse_all_flags() {
-        let a = parse(&[
-            "--socket=/s",
-            "--parent-fd=5",
-            "--synthetic",
-            "--chunk-size=4096",
-            "--no-coalesce-reads",
-            "--grpc-subchannels=4",
-            "--worker-threads=8",
-            "--stream-window=65535",
-            "--connection-window=131072",
-        ])
-        .unwrap();
-        assert_eq!(
-            a,
-            Args {
-                socket: PathBuf::from("/s"),
-                parent_fd: Some(5),
-                synthetic: true,
-                chunk_size: 4096,
-                coalesce_reads: false,
-                grpc_subchannels: Some(4),
-                worker_threads: Some(8),
-                stream_window: 65535,
-                connection_window: 131072,
-            }
-        );
-    }
-
-    /// Missing/empty socket, unknown flags, non-numeric values, chunk sizes
-    /// outside [1, MAX_CHUNK], and HTTP/2 flow-control windows outside
-    /// [65_535, 0x7fff_ffff] are rejected.
-    #[test]
-    fn parse_rejects_bad_input() {
-        let max_plus_one = format!("--chunk-size={}", service::MAX_CHUNK + 1);
-        for bad in [
-            vec![],
-            vec!["--socket="],
-            vec!["--socket=/s", "--bogus"],
-            vec!["--socket=/s", "--parent-fd=x"],
-            vec!["--socket=/s", "--parent-fd=-1"],
-            vec!["--socket=/s", "--parent-fd=2"],
-            vec!["--socket=/s", "--grpc-subchannels=0"],
-            vec!["--socket=/s", "--worker-threads=0"],
-            vec!["--socket=/s", "--chunk-size=0"],
-            vec!["--socket=/s", max_plus_one.as_str()],
-            vec!["--socket=/s", "--stream-window=0"],
-            vec!["--socket=/s", "--stream-window=65534"],
-            vec!["--socket=/s", "--stream-window=2147483648"],
-            vec!["--socket=/s", "--connection-window=0"],
-            vec!["--socket=/s", "--connection-window=65534"],
-            vec!["--socket=/s", "--connection-window=2147483648"],
-        ] {
-            assert!(parse(&bad).is_err(), "{bad:?}");
-        }
-    }
 
     /// A stale socket file is replaced; a regular file at the path is never
     /// deleted.

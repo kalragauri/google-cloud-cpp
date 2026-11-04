@@ -127,6 +127,11 @@ class Target {
   virtual std::string Name() const = 0;
   /// Free-form `key=value;...` describing the configuration (CSV `labels`).
   virtual std::string Labels() const = 0;
+  /// True when PeerSnapshot() reports a share of *this* process (a core on
+  /// threads of the benchmark) rather than another process (a sidecar). The
+  /// runner then reports `app = process - peer`, so `app + peer` is the whole
+  /// process either way.
+  virtual bool PeerSharesProcess() const { return false; }
   /// Counters of a second process doing work for this implementation.
   virtual std::optional<ProcessSnapshot> PeerSnapshot() { return std::nullopt; }
 
@@ -261,6 +266,14 @@ using Clock = std::chrono::steady_clock;
 /// One measured operation: wall time and benchmark-process counters between
 /// construction and Stop(); peer counters around the whole window.
 struct Sample {
+  Sample(std::string workload, std::string op, int iteration,
+         std::int64_t object_size = 0, std::int64_t bytes = 0)
+      : workload(std::move(workload)),
+        op(std::move(op)),
+        iteration(iteration),
+        object_size(object_size),
+        bytes(bytes) {}
+
   std::string workload;
   std::string op;
   int iteration = 0;
@@ -276,6 +289,40 @@ struct Sample {
   std::int64_t rss_kib_app = 0;
   std::int64_t rss_kib_peer = 0;
 };
+
+/// Fills the app/peer counters of `s` from snapshots taken in the order
+/// `peer_before, self_before, <work>, self_after, peer_after`: the peer reads
+/// (an RPC to a sidecar, or a walk over core-thread clocks in-process) run
+/// outside the [self_before, self_after] window, so their own cost is never
+/// charged to the work. When the peer shares this process, its deltas are
+/// subtracted from the process deltas; allocations are clamped at 0 because
+/// the peer window is slightly wider than the process window.
+inline void Attribute(Sample& s, ProcessSnapshot const& self_before,
+                      ProcessSnapshot const& self_after,
+                      std::optional<ProcessSnapshot> const& peer_before,
+                      std::optional<ProcessSnapshot> const& peer_after,
+                      bool peer_shares_process, bool peak_rss) {
+  double self_cpu_us = self_after.cpu_us - self_before.cpu_us;
+  auto self_alloc = static_cast<std::int64_t>(self_after.alloc_bytes -
+                                              self_before.alloc_bytes);
+  s.rss_kib_app = peak_rss ? self_after.peak_rss_kib : self_after.rss_kib;
+  if (peer_before && peer_after) {
+    double const peer_cpu_us = peer_after->cpu_us - peer_before->cpu_us;
+    auto const peer_alloc = static_cast<std::int64_t>(peer_after->alloc_bytes -
+                                                      peer_before->alloc_bytes);
+    s.cpu_ms_peer = peer_cpu_us / 1000.0;
+    s.alloc_peer =
+        static_cast<std::uint64_t>(std::max<std::int64_t>(0, peer_alloc));
+    s.rss_kib_peer = peak_rss ? peer_after->peak_rss_kib : peer_after->rss_kib;
+    if (peer_shares_process) {
+      self_cpu_us = std::max(0.0, self_cpu_us - peer_cpu_us);
+      self_alloc -= peer_alloc;
+    }
+  }
+  s.cpu_ms_app = self_cpu_us / 1000.0;
+  s.alloc_app =
+      static_cast<std::uint64_t>(std::max<std::int64_t>(0, self_alloc));
+}
 
 class Recorder {
  public:
@@ -394,8 +441,8 @@ class Runner {
               << " bucket=" << a_.bucket << " workload=" << a_.workload
               << " iterations=" << a_.iterations << " csv=" << csv << "\n";
     gen_.Seed(42);
-    ProcessSnapshot const self_start = SelfSnapshot();
     std::optional<ProcessSnapshot> const peer_start = t_.PeerSnapshot();
+    ProcessSnapshot const self_start = SelfSnapshot();
     Clock::time_point const t0 = Clock::now();
     if (a_.workload == "list") {
       ListWorkload(rec);
@@ -409,15 +456,9 @@ class Runner {
     total.wall_ms =
         std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     ProcessSnapshot const self_end = SelfSnapshot();
-    total.cpu_ms_app = (self_end.cpu_us - self_start.cpu_us) / 1000.0;
-    total.alloc_app = self_end.alloc_bytes - self_start.alloc_bytes;
-    total.rss_kib_app = self_end.peak_rss_kib;
-    if (std::optional<ProcessSnapshot> peer_end = t_.PeerSnapshot();
-        peer_end && peer_start) {
-      total.cpu_ms_peer = (peer_end->cpu_us - peer_start->cpu_us) / 1000.0;
-      total.alloc_peer = peer_end->alloc_bytes - peer_start->alloc_bytes;
-      total.rss_kib_peer = peer_end->peak_rss_kib;
-    }
+    std::optional<ProcessSnapshot> const peer_end = t_.PeerSnapshot();
+    Attribute(total, self_start, self_end, peer_start, peer_end,
+              t_.PeerSharesProcess(), /*peak_rss=*/true);
     rec.Add(total);
     rec.PrintSummary();
     return 0;
@@ -448,14 +489,8 @@ class Runner {
     std::optional<ProcessSnapshot> const peer_after = t_.PeerSnapshot();
     Sample s{a_.workload, op, i, size, err.empty() ? bytes : 0};
     s.wall_ms = std::chrono::duration<double, std::milli>(wall).count();
-    s.cpu_ms_app = (self_after.cpu_us - self_before.cpu_us) / 1000.0;
-    s.alloc_app = self_after.alloc_bytes - self_before.alloc_bytes;
-    s.rss_kib_app = self_after.rss_kib;
-    if (peer_before && peer_after) {
-      s.cpu_ms_peer = (peer_after->cpu_us - peer_before->cpu_us) / 1000.0;
-      s.alloc_peer = peer_after->alloc_bytes - peer_before->alloc_bytes;
-      s.rss_kib_peer = peer_after->rss_kib;
-    }
+    Attribute(s, self_before, self_after, peer_before, peer_after,
+              t_.PeerSharesProcess(), /*peak_rss=*/false);
     s.ok = err.empty();
     s.error = err;
     if (i >= 0) rec.Add(std::move(s));  // warm-up iterations are not recorded
@@ -653,14 +688,8 @@ class Runner {
     Sample s{a_.workload, write ? "THROUGHPUT-WRITE" : "THROUGHPUT-READ", 0,
              size, total_bytes.load()};
     s.wall_ms = std::chrono::duration<double, std::milli>(wall).count();
-    s.cpu_ms_app = (self_after.cpu_us - self_before.cpu_us) / 1000.0;
-    s.alloc_app = self_after.alloc_bytes - self_before.alloc_bytes;
-    s.rss_kib_app = self_after.peak_rss_kib;
-    if (peer_before && peer_after) {
-      s.cpu_ms_peer = (peer_after->cpu_us - peer_before->cpu_us) / 1000.0;
-      s.alloc_peer = peer_after->alloc_bytes - peer_before->alloc_bytes;
-      s.rss_kib_peer = peer_after->peak_rss_kib;
-    }
+    Attribute(s, self_before, self_after, peer_before, peer_after,
+              t_.PeerSharesProcess(), /*peak_rss=*/true);
     s.ok = errors.load() == 0;
     if (!s.ok) s.error = std::to_string(errors.load()) + " errors";
     rec.Add(std::move(s));

@@ -14,8 +14,8 @@
 
 #include "gcs_core/client.h"
 #include "absl/strings/str_cat.h"
+#include "core_backend.h"
 #include "gcs/core/v0/storage_core.grpc.pb.h"
-#include "sidecar_process.h"
 #include "status.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
@@ -31,13 +31,13 @@ using ::google::cloud::StatusCode;
 
 namespace {
 
-/// Default and maximum size of one data message sent to the sidecar. Uploads
+/// Default and maximum size of one data message sent to the core. Uploads
 /// are framed into messages of this size, matching `service::MAX_CHUNK`
-/// (16 MiB) inside the sidecar's 32 MiB gRPC message envelope.
+/// (16 MiB) inside the core's 32 MiB gRPC message envelope.
 constexpr std::uint32_t kDefaultChunkSize = 1024 * 1024;
 constexpr std::uint32_t kMaxChunkSize = 16 * 1024 * 1024;
 /// Bound on best-effort `CloseObject` during `~ObjectDescriptor()` so a hung
-/// or stopped sidecar cannot stall stack unwinding indefinitely.
+/// or stopped core cannot stall stack unwinding indefinitely.
 constexpr std::chrono::milliseconds kDescriptorCloseTimeout{500};
 
 constexpr std::uint32_t WriteChunkSize(std::uint32_t chunk_size_hint) {
@@ -45,42 +45,40 @@ constexpr std::uint32_t WriteChunkSize(std::uint32_t chunk_size_hint) {
                               : std::min(chunk_size_hint, kMaxChunkSize);
 }
 
-std::string SuffixSocketPath(std::string const& base, std::uint64_t seq) {
-  constexpr std::string_view kSockSuffix = ".sock";
-  if (base.size() > kSockSuffix.size() &&
-      std::string_view(base).substr(base.size() - kSockSuffix.size()) ==
-          kSockSuffix) {
-    return absl::StrCat(base.substr(0, base.size() - kSockSuffix.size()), "-",
-                        seq, kSockSuffix);
-  }
-  return absl::StrCat(base, "-", seq);
-}
-
 }  // namespace
 
-/// Identifies a sidecar configuration. `Client` instances with matching keys
-/// share one sidecar process; `chunk_size_hint` is carried per `Client`.
-struct ConnectionKey {
-  std::string binary;
-  std::string configured_socket;
-  std::vector<std::string> sidecar_args;
-  int channels = 1;
+grpc::ChannelArguments LocalChannelArguments(int channel_index) {
+  grpc::ChannelArguments args;
+  args.SetMaxReceiveMessageSize(-1);
+  args.SetMaxSendMessageSize(-1);
+  // Distinct arguments plus a local subchannel pool give each channel its
+  // own connection instead of sharing one.
+  args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+  args.SetInt("gcs_core.channel_index", channel_index);
+  // For `unix:` targets gRPC uses the socket path as `:authority`, which the
+  // core's HTTP/2 stack (hyper/h2) rejects with RST_STREAM(PROTOCOL_ERROR);
+  // channels created from a descriptor default to `test.authority`. Any
+  // valid host name works, and the same one keeps both variants identical.
+  args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "localhost");
+  // The first connect usually races the sidecar creating its socket. gRPC's
+  // default 1 s reconnect backoff would then dominate startup; a local socket
+  // needs only milliseconds between attempts. (A descriptor channel never
+  // reconnects; the arguments are harmless there.)
+  args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 5);
+  args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 5);
+  args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 100);
+  return args;
+}
 
-  bool operator==(ConnectionKey const& rhs) const {
-    return binary == rhs.binary && configured_socket == rhs.configured_socket &&
-           sidecar_args == rhs.sidecar_args && channels == rhs.channels;
-  }
-};
-
-/// The stubs of one running sidecar generation. Replaced as a whole on
-/// respawn, so a call in flight keeps using the set it started with.
+/// The stubs of one running core generation. Replaced as a whole on
+/// restart, so a call in flight keeps using the set it started with.
 struct StubSet {
   std::uint64_t generation = 0;
   std::vector<std::unique_ptr<v0::StorageCore::Stub>> stubs;
 };
 
-/// One sidecar process plus the gRPC channels to it, shared by `Client`
-/// instances with the same `ConnectionKey`.
+/// One running core (whatever the backend) plus the gRPC channels to it,
+/// shared by `Client` instances whose backends have the same sharing key.
 class Connection {
  public:
   static StatusOr<std::shared_ptr<Connection>> GetOrCreate(
@@ -92,15 +90,9 @@ class Connection {
       return Status(StatusCode::kInvalidArgument,
                     "readiness_timeout must be > 0");
     }
-    StatusOr<std::string> binary = ResolveSidecarPath(options.sidecar_path);
-    if (!binary) return std::move(binary).status();
-    if (!options.socket_path.empty()) {
-      if (Status s = ValidateSocketPath(options.socket_path); !s.ok()) return s;
-    }
 
     static std::mutex mu;
     static std::vector<std::weak_ptr<Connection>> active;
-    static std::uint64_t next_socket_seq = 0;
     std::scoped_lock lk(mu);
 
     std::vector<std::shared_ptr<Connection>> live;
@@ -113,41 +105,29 @@ class Connection {
                                 }),
                  active.end());
 
-    ConnectionKey key{*binary, options.socket_path, options.sidecar_args,
-                      options.channels};
+    std::vector<std::string> sockets_in_use;
     for (std::shared_ptr<Connection> const& c : live) {
-      if (c->key_ == key) return c;
-      if (!options.socket_path.empty() && c->socket_ == options.socket_path) {
+      if (!c->backend_->SocketPath().empty()) {
+        sockets_in_use.push_back(c->backend_->SocketPath());
+      }
+    }
+    StatusOr<std::unique_ptr<CoreBackend>> backend =
+        MakeCoreBackend(options, sockets_in_use);
+    if (!backend) return std::move(backend).status();
+    for (std::shared_ptr<Connection> const& c : live) {
+      if (c->backend_->SharingKey() == (*backend)->SharingKey()) return c;
+      if (!(*backend)->SocketPath().empty() &&
+          c->backend_->SocketPath() == (*backend)->SocketPath()) {
         return Status(
             StatusCode::kFailedPrecondition,
-            absl::StrCat("socket path ", options.socket_path,
+            absl::StrCat("socket path ", (*backend)->SocketPath(),
                          " is already in use by a sidecar with different "
                          "ClientOptions"));
       }
     }
 
-    auto socket_in_use = [&](std::string const& candidate) {
-      return std::any_of(live.begin(), live.end(),
-                         [&](std::shared_ptr<Connection> const& c) {
-                           return c->socket_ == candidate;
-                         });
-    };
-
-    std::string socket;
-    if (!options.socket_path.empty()) {
-      socket = options.socket_path;
-    } else {
-      StatusOr<std::string> base = DefaultSocketPath();
-      if (!base) return std::move(base).status();
-      socket = *base;
-      while (socket_in_use(socket)) {
-        socket = SuffixSocketPath(*base, ++next_socket_seq);
-      }
-    }
-    if (Status s = ValidateSocketPath(socket); !s.ok()) return s;
-
-    auto conn = std::shared_ptr<Connection>(new Connection(
-        std::move(key), std::move(socket), options.readiness_timeout));
+    auto conn = std::shared_ptr<Connection>(
+        new Connection(*std::move(backend), options.readiness_timeout));
     std::scoped_lock clk(conn->mu_);
     if (Status s = conn->StartLocked(); !s.ok()) return s;
     active.push_back(conn);
@@ -156,7 +136,13 @@ class Connection {
 
   ~Connection() {
     std::scoped_lock lk(mu_);
-    StopLocked();
+    // Our channels first: an in-process core drains open connections before
+    // it stops, and no caller can hold a stub once the last Client is gone.
+    {
+      std::scoped_lock slk(stubs_mu_);
+      stubs_.reset();
+    }
+    backend_->Stop();
   }
 
   /// Round-robin over the channels. `stubs_mu_` only guards copying the
@@ -167,32 +153,34 @@ class Connection {
     return *keepalive->stubs[i % keepalive->stubs.size()];
   }
 
-  /// Called after a failed RPC. If the sidecar generation that served this
-  /// RPC died, start a new one once so the next call succeeds; concurrent
+  /// Called after a failed RPC. If the core generation that served this RPC
+  /// died, start a new one once so the next call succeeds; concurrent
   /// callers failing on the same generation observe the already-bumped
-  /// `generation_` and do not respawn a second time.
+  /// `generation_` and do not restart a second time.
   Status Check(Status status, std::uint64_t failed_generation) {
     if (status.code() != StatusCode::kUnavailable) return status;
     std::scoped_lock lk(mu_);
     if (failed_generation != generation_) {
       return Status(
           StatusCode::kUnavailable,
-          absl::StrCat("sidecar restarted after failure: ", status.message()));
+          absl::StrCat("core restarted after failure: ", status.message()));
     }
-    if (process_ && process_->Exited()) {
-      std::string const why = process_->ExitDescription();
-      StopLocked();
+    if (backend_->Exited()) {
+      std::string const why = backend_->ExitDescription();
+      // The stubs stay in place until StartLocked replaces them, so a
+      // concurrent caller never observes an empty set.
+      backend_->Stop();
       if (Status s = StartLocked(); !s.ok()) return s;
       return Status(
           StatusCode::kUnavailable,
-          absl::StrCat("sidecar ", why,
+          absl::StrCat(backend_->Describe(), " ", why,
                        "; restarted it for the next call: ", status.message()));
     }
     return status;
   }
 
   /// Dispatches one unary RPC on a round-robin channel and checks for crash
-  /// respawn on `UNAVAILABLE`.
+  /// restart on `UNAVAILABLE`.
   template <typename Request, typename Response>
   Status Unary(grpc::Status (v0::StorageCore::Stub::*method)(
                    grpc::ClientContext*, Request const&, Response*),
@@ -206,15 +194,23 @@ class Connection {
 
   int pid() const {
     std::scoped_lock lk(mu_);
-    return process_ ? process_->pid() : 0;
+    return backend_->pid();
+  }
+
+  std::optional<std::uint64_t> CoreThreadCpuMicros() const {
+    std::scoped_lock lk(mu_);
+    return backend_->CoreThreadCpuMicros();
+  }
+
+  void KillForTesting() {
+    std::scoped_lock lk(mu_);
+    backend_->Kill();
   }
 
  private:
-  Connection(ConnectionKey key, std::string socket,
+  Connection(std::unique_ptr<CoreBackend> backend,
              std::chrono::milliseconds readiness_timeout)
-      : key_(std::move(key)),
-        socket_(std::move(socket)),
-        readiness_timeout_(readiness_timeout) {}
+      : backend_(std::move(backend)), readiness_timeout_(readiness_timeout) {}
 
   std::shared_ptr<StubSet> CurrentStubs() const {
     std::scoped_lock lk(stubs_mu_);
@@ -222,32 +218,12 @@ class Connection {
   }
 
   Status StartLocked() {
-    StatusOr<std::unique_ptr<SidecarProcess>> process =
-        SidecarProcess::Spawn(key_.binary, socket_, key_.sidecar_args);
-    if (!process) return std::move(process).status();
-    process_ = *std::move(process);
+    StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> channels =
+        backend_->Start();
+    if (!channels) return std::move(channels).status();
     auto set = std::make_shared<StubSet>();
     set->generation = ++generation_;
-    for (int i = 0; i != key_.channels; ++i) {
-      grpc::ChannelArguments args;
-      args.SetMaxReceiveMessageSize(-1);
-      args.SetMaxSendMessageSize(-1);
-      // Distinct arguments plus a local subchannel pool give each channel
-      // its own connection instead of sharing one.
-      args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
-      args.SetInt("gcs_core.channel_index", i);
-      // For `unix:` targets gRPC uses the socket path as `:authority`,
-      // which the sidecar's HTTP/2 stack (hyper/h2) rejects with
-      // RST_STREAM(PROTOCOL_ERROR). Any valid host name works.
-      args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "localhost");
-      // The first connect usually races the sidecar creating its socket.
-      // gRPC's default 1 s reconnect backoff would then dominate startup;
-      // a local socket needs only milliseconds between attempts.
-      args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 5);
-      args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 5);
-      args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 100);
-      std::shared_ptr<grpc::Channel> channel = grpc::CreateCustomChannel(
-          "unix:" + socket_, grpc::InsecureChannelCredentials(), args);
+    for (std::shared_ptr<grpc::Channel>& channel : *channels) {
       set->stubs.push_back(v0::StorageCore::NewStub(std::move(channel)));
     }
     {
@@ -262,11 +238,11 @@ class Connection {
         std::chrono::steady_clock::now() + readiness_timeout_;
     Status last;
     while (std::chrono::steady_clock::now() < deadline) {
-      if (process_->Exited()) {
-        return Status(StatusCode::kFailedPrecondition,
-                      absl::StrCat("sidecar ", key_.binary, " ",
-                                   process_->ExitDescription(),
-                                   " before becoming ready"));
+      if (backend_->Exited()) {
+        return Status(
+            StatusCode::kFailedPrecondition,
+            absl::StrCat(backend_->Describe(), " ", backend_->ExitDescription(),
+                         " before becoming ready"));
       }
       // Every channel must be connected, so the first measured call does not
       // pay connection setup.
@@ -287,30 +263,26 @@ class Connection {
       }
       if (all_ready) return {};
     }
-    process_->Terminate(std::chrono::milliseconds(0));
-    return Status(StatusCode::kDeadlineExceeded,
-                  absl::StrCat("sidecar did not become ready within ",
-                               readiness_timeout_.count(),
-                               "ms; last error: ", last.message()));
+    backend_->Kill();
+    return Status(
+        StatusCode::kDeadlineExceeded,
+        absl::StrCat(backend_->Describe(), " did not become ready within ",
+                     readiness_timeout_.count(),
+                     "ms; last error: ", last.message()));
   }
 
-  void StopLocked() {
-    if (!process_) return;
-    // Closing the lifetime pipe is the shutdown signal; no RPC is needed.
-    process_->Terminate();
-    process_.reset();
-  }
-
-  ConnectionKey const key_;
-  std::string const socket_;
+  std::unique_ptr<CoreBackend> const backend_;
   std::chrono::milliseconds const readiness_timeout_;
   mutable std::mutex mu_;
-  std::unique_ptr<SidecarProcess> process_;
   std::uint64_t generation_ = 0;
   mutable std::mutex stubs_mu_;
   std::shared_ptr<StubSet> stubs_;
   std::atomic<std::size_t> next_{0};
 };
+
+void KillCoreForTesting(Client const& client) {
+  client.conn_->KillForTesting();
+}
 
 namespace {
 /// Splits `data` into messages of at most `chunk` bytes. `Cord::Subcord`
@@ -346,7 +318,7 @@ class ReaderImpl {
       Status s = FromGrpc(reader_->Finish());
       if (s.ok()) {
         return Status(StatusCode::kInternal,
-                      "sidecar closed ReadObject without metadata");
+                      "core closed ReadObject without metadata");
       }
       return conn_->Check(std::move(s), stubs_->generation);
     }
@@ -760,5 +732,9 @@ StatusOr<SidecarStats> Client::GetSidecarStats() {
 }
 
 int Client::sidecar_pid() const { return conn_->pid(); }
+
+std::optional<std::uint64_t> Client::core_thread_cpu_us() const {
+  return conn_->CoreThreadCpuMicros();
+}
 
 }  // namespace gcs_core

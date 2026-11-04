@@ -28,24 +28,35 @@
 #include <vector>
 
 /**
- * Thin C++ wrapper over the Rust `core-sdk` sidecar (POC).
+ * Thin C++ wrapper over the Rust `core-sdk` (POC).
  *
- * The wrapper contains no storage logic: every call is forwarded over gRPC on
- * a Unix domain socket to a sidecar process that runs the Rust
- * `google-cloud-storage` crate. Retries, resumable-upload state, checksum
- * validation and credentials (Application Default Credentials) all live in
- * the sidecar. Statuses are returned exactly as the sidecar reports them.
+ * The wrapper contains no storage logic: every call is forwarded over gRPC to
+ * the core, which runs the Rust `google-cloud-storage` crate. Retries,
+ * resumable-upload state, checksum validation and credentials (Application
+ * Default Credentials) all live in the core. Statuses are returned exactly as
+ * the core reports them.
+ *
+ * The same header serves two libraries that differ only in where the core
+ * runs: `gcs_core` starts it as the `gcs-core-sidecar` process and talks to
+ * it over a Unix domain socket; `gcs_core_inproc` links it in and runs it on
+ * threads of this process. Fields and functions that only make sense for one
+ * of them say so.
  */
 namespace gcs_core {
 
 using ::google::cloud::Status;
 using ::google::cloud::StatusOr;
 
+class Client;
+
 namespace internal {
 class Connection;
 class ReaderImpl;
 class WriterImpl;
 class AppendableWriterImpl;
+/// Test hook: terminates the core serving `client` without draining, as a
+/// crash would; the next failing call restarts it.
+void KillCoreForTesting(Client const& client);
 }  // namespace internal
 
 struct ObjectMetadata {
@@ -94,12 +105,15 @@ struct ListObjectsPage {
 struct SidecarVersion {
   std::string sidecar_version;
   std::string storage_crate_version;
+  /// Pid of the process serving the core: the sidecar, or this process.
   std::uint32_t pid = 0;
   bool bidi_enabled = false;
   bool synthetic = false;
 };
 
-/// Cumulative process counters of the sidecar; diff two snapshots.
+/// Cumulative counters of the process serving the core; diff two snapshots.
+/// In-process they describe this process itself and `allocated_bytes` is 0
+/// (the core's allocations go through the application's own `malloc`).
 struct SidecarStats {
   std::uint64_t user_cpu_us = 0;
   std::uint64_t system_cpu_us = 0;
@@ -112,19 +126,23 @@ struct SidecarStats {
 struct ClientOptions {
   /// Sidecar binary. Empty: `$GCS_CORE_SIDECAR`, then `gcs-core-sidecar`
   /// next to the running executable, then `gcs-core-sidecar` on `PATH`.
+  /// Sidecar variant only; the in-process variant rejects a non-empty value.
   std::string sidecar_path;
   /// Socket path. Empty: `$XDG_RUNTIME_DIR/gcs-core-<pid>.sock`, else
-  /// `/tmp/gcs-core-<uid>/<pid>.sock`.
+  /// `/tmp/gcs-core-<uid>/<pid>.sock`. Sidecar variant only; the in-process
+  /// variant rejects a non-empty value.
   std::string socket_path;
-  /// Extra sidecar arguments, e.g. `--synthetic` or `--chunk-size=N`.
+  /// Extra core arguments, e.g. `--synthetic` or `--chunk-size=N`. Both
+  /// variants accept the same core flags; the in-process variant adds
+  /// `--link=socketpair|abstract` and rejects `--socket`/`--parent-fd`.
   std::vector<std::string> sidecar_args;
-  /// Number of independent HTTP/2 connections over the socket.
+  /// Number of independent HTTP/2 connections to the core.
   int channels = 1;
   /// Upper bound for read and write chunk messages (clamped to 16 MiB); 0 lets
   /// the sidecar choose on reads and uses 1 MiB on writes.
   std::uint32_t chunk_size_hint = 0;
-  /// Must be > 0. Shared sidecar connections retain the first caller's timeout
-  /// for subsequent crash respawns.
+  /// Must be > 0. Shared connections retain the first caller's timeout for
+  /// subsequent crash restarts.
   std::chrono::milliseconds readiness_timeout{5000};
 };
 
@@ -211,7 +229,7 @@ class ObjectDescriptor {
 
 class Client {
  public:
-  /// Starts (or reuses) a sidecar matching `(sidecar_path, socket_path,
+  /// Starts (or reuses) a core matching `(sidecar_path, socket_path,
   /// sidecar_args, channels)` and waits until it serves.
   static StatusOr<Client> Create(ClientOptions const& options = {});
 
@@ -240,10 +258,16 @@ class Client {
 
   StatusOr<SidecarVersion> GetSidecarVersion();
   StatusOr<SidecarStats> GetSidecarStats();
-  /// Pid of the sidecar currently serving this client.
+  /// Pid of the process serving this client's core (this process when the
+  /// core runs in-process).
   int sidecar_pid() const;
+  /// CPU time (user + system, microseconds) consumed so far by the core's
+  /// threads when they run in this process; `nullopt` for a sidecar, whose
+  /// CPU is in `GetSidecarStats()`. Carried across crash restarts.
+  std::optional<std::uint64_t> core_thread_cpu_us() const;
 
  private:
+  friend void internal::KillCoreForTesting(Client const& client);
   Client(std::shared_ptr<internal::Connection> conn,
          std::uint32_t chunk_size_hint);
   std::shared_ptr<internal::Connection> conn_;

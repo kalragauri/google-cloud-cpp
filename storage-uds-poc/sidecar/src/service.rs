@@ -55,6 +55,22 @@ pub struct Clients {
     pub control: StorageControl,
 }
 
+impl Clients {
+    /// Default endpoints only: the core is Cloudpath by construction.
+    /// Credentials are Application Default Credentials of the hosting process.
+    pub async fn build(
+        grpc_subchannels: Option<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let mut storage = Storage::builder();
+        if let Some(n) = grpc_subchannels {
+            storage = storage.with_grpc_subchannel_count(n);
+        }
+        let storage = storage.build().await?;
+        let control = StorageControl::builder().build().await?;
+        Ok(Self { storage, control })
+    }
+}
+
 enum Descriptor {
     Real(ObjectDescriptor),
     Synthetic { size: u64 },
