@@ -52,6 +52,9 @@ class CoreBackend {
   /// Starts the core and returns one channel per configured channel. The
   /// channels may still be connecting; the caller polls `Ping`.
   virtual StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> Start() = 0;
+  /// Called once `Ping` succeeds on every channel, so a daemon backend whose
+  /// spawned child lost a startup race can adopt the winning listener PID.
+  virtual void OnReady() {}
   /// True once the core stopped on its own after `Start()`.
   virtual bool Exited() = 0;
   /// Why the core stopped; meaningful once `Exited()` is true.

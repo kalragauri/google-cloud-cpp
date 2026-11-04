@@ -62,8 +62,12 @@ class FakeCore final : public pb::GcsCore::Service {
     return grpc::Status::OK;
   }
 
-  grpc::Status Stats(grpc::ServerContext*, pb::StatsRequest const*,
+  grpc::Status Stats(grpc::ServerContext*, pb::StatsRequest const* request,
                      pb::StatsResponse* response) override {
+    {
+      std::scoped_lock lk(mu);
+      stats_requests.push_back(*request);
+    }
     response->set_pid(4242);
     response->set_cpu_user_secs(1.5);
     response->set_cpu_sys_secs(0.25);
@@ -94,6 +98,7 @@ class FakeCore final : public pb::GcsCore::Service {
     first.mutable_meta()->set_generation(77);
     first.mutable_meta()->set_metageneration(3);
     first.mutable_meta()->set_content_type("text/plain");
+    first.mutable_meta()->set_content_encoding("gzip");
     first.mutable_meta()->set_crc32c(0xdeadbeef);
     writer->Write(first);
     for (std::size_t offset = 0; offset < data.size(); offset += 10) {
@@ -247,6 +252,7 @@ class FakeCore final : public pb::GcsCore::Service {
   std::vector<pb::ListBucketsRequest> list_buckets_requests;
   std::vector<pb::DeleteObjectRequest> delete_requests;
   std::vector<pb::ReadRangeRequest> range_requests;
+  std::vector<pb::StatsRequest> stats_requests;
   std::vector<std::uint64_t> closed_handles;
 };
 
@@ -314,8 +320,26 @@ TEST_F(FakeCoreTest, ReadObjectMetadataAndSlices) {
   EXPECT_EQ(m.generation, 77);
   EXPECT_EQ(m.metageneration, 3);
   EXPECT_EQ(m.content_type, "text/plain");
+  EXPECT_EQ(m.content_encoding, "gzip");
   EXPECT_EQ(m.crc32c, std::optional<std::uint32_t>(0xdeadbeef));
   EXPECT_EQ(ReadAll(*reader), "0123456789abcdefghijklmnopqrstuvw");
+}
+
+/// @test ReadObject forwards `if_generation_match` when set (including 0) and
+/// leaves it unset otherwise.
+TEST_F(FakeCoreTest, ReadObjectPreconditionPresence) {
+  fake_.objects["obj"] = "abc";
+  StatusOr<Client> client = MakeClient();
+  ASSERT_THAT(client, IsOk());
+  ASSERT_THAT(client->ReadObject("bkt", "obj", {}, 0, std::nullopt), IsOk());
+  ASSERT_THAT(client->ReadObject("bkt", "obj", {}, 0, 0), IsOk());
+  ASSERT_THAT(client->ReadObject("bkt", "obj", {}, 5, 42), IsOk());
+  ASSERT_THAT(fake_.read_requests, SizeIs(3));
+  EXPECT_FALSE(fake_.read_requests[0].has_if_generation_match());
+  ASSERT_TRUE(fake_.read_requests[1].has_if_generation_match());
+  EXPECT_EQ(fake_.read_requests[1].if_generation_match(), 0);
+  ASSERT_TRUE(fake_.read_requests[2].has_if_generation_match());
+  EXPECT_EQ(fake_.read_requests[2].if_generation_match(), 42);
 }
 
 /// @test A zero-byte object yields metadata and an immediate end of data.
@@ -496,11 +520,14 @@ TEST_F(FakeCoreTest, GenerationPreconditionPresence) {
   ASSERT_THAT(client->InsertObject("bkt", "a", absl::Cord("1"), none), IsOk());
   WriteOptions zero;
   zero.if_generation_match = 0;
+  zero.resumable_buffer_size = 4 * 1024 * 1024;
   ASSERT_THAT(client->InsertObject("bkt", "b", absl::Cord("1"), zero), IsOk());
   ASSERT_THAT(fake_.writes, SizeIs(2));
   EXPECT_FALSE(fake_.writes[0].front().header().has_if_generation_match());
+  EXPECT_EQ(fake_.writes[0].front().header().chunk_size(), 0U);
   ASSERT_TRUE(fake_.writes[1].front().header().has_if_generation_match());
   EXPECT_EQ(fake_.writes[1].front().header().if_generation_match(), 0);
+  EXPECT_EQ(fake_.writes[1].front().header().chunk_size(), 4U * 1024 * 1024);
   EXPECT_EQ(fake_.writes[1].front().header().known_size(), 1)
       << "InsertObject passes the data size";
 }
@@ -526,6 +553,16 @@ TEST_F(FakeCoreTest, AppendableRequiresGrpcTransport) {
   ASSERT_THAT(fallback, IsOk());
   ASSERT_THAT(fallback->Write(absl::Cord("x")), IsOk());
   EXPECT_THAT(fallback->Finalize(), StatusIs(StatusCode::kFailedPrecondition));
+
+  StatusOr<AppendableWriter> allowed_fallback =
+      client->StartAppendableUpload("bkt", "regional-allowed");
+  ASSERT_THAT(allowed_fallback, IsOk());
+  ASSERT_THAT(allowed_fallback->Write(absl::Cord("xy")), IsOk());
+  StatusOr<ObjectMetadata> fallback_meta =
+      allowed_fallback->Finalize(/*allow_json_fallback=*/true);
+  ASSERT_THAT(fallback_meta, IsOk());
+  EXPECT_EQ(fallback_meta->size, 2U);
+  EXPECT_TRUE(fallback_meta->used_json_fallback);
 
   StatusOr<AppendableWriter> open = client->StartAppendableUpload("bkt", "o");
   ASSERT_THAT(open, IsOk());
@@ -607,16 +644,20 @@ TEST_F(FakeCoreTest, ListBucketsFields) {
 /// NOT_FOUND.
 TEST_F(FakeCoreTest, DeleteObject) {
   fake_.objects["gone"] = "x";
+  fake_.objects["guarded"] = "y";
   StatusOr<Client> client = MakeClient();
   ASSERT_THAT(client, IsOk());
   ASSERT_THAT(client->DeleteObject("bkt", "gone", 8), IsOk());
+  ASSERT_THAT(client->DeleteObject("bkt", "guarded", 0, 0), IsOk());
   EXPECT_THAT(client->DeleteObject("bkt", "gone"),
               StatusIs(StatusCode::kNotFound));
-  ASSERT_THAT(fake_.delete_requests, SizeIs(2));
+  ASSERT_THAT(fake_.delete_requests, SizeIs(3));
   EXPECT_EQ(fake_.delete_requests[0].bucket(), "bkt");
   EXPECT_EQ(fake_.delete_requests[0].object(), "gone");
   EXPECT_EQ(fake_.delete_requests[0].generation(), 8);
   EXPECT_FALSE(fake_.delete_requests[0].has_if_generation_match());
+  ASSERT_TRUE(fake_.delete_requests[1].has_if_generation_match());
+  EXPECT_EQ(fake_.delete_requests[1].if_generation_match(), 0);
 }
 
 /// @test ReadRanges issues one ReadRange per range on the descriptor's handle
@@ -748,6 +789,11 @@ TEST_F(FakeCoreTest, StatsAndVersion) {
   StatusOr<SidecarVersion> version = client->GetSidecarVersion();
   ASSERT_THAT(version, IsOk());
   EXPECT_EQ(version->pid, 4242U);
+  ASSERT_THAT(client->GetSidecarStats(/*reset_peak_rss=*/true), IsOk());
+  ASSERT_THAT(fake_.stats_requests, SizeIs(3));
+  EXPECT_FALSE(fake_.stats_requests[0].reset_peak_rss());
+  EXPECT_FALSE(fake_.stats_requests[1].reset_peak_rss());
+  EXPECT_TRUE(fake_.stats_requests[2].reset_peak_rss());
 }
 
 }  // namespace

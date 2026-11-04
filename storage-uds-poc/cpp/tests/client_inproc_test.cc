@@ -82,6 +82,16 @@ std::int64_t StatusField(char const* key) {
   return -1;
 }
 
+/// @test The sidecar lifecycle mode has no meaning in-process and `kChild` is
+/// rejected rather than silently ignored.
+TEST(InprocClientTest, RejectsSidecarMode) {
+  ClientOptions options = ServerOptions();
+  options.sidecar_mode = SidecarMode::kChild;
+  StatusOr<Client> client = Client::Create(options);
+  EXPECT_THAT(client, StatusIs(StatusCode::kInvalidArgument));
+  EXPECT_THAT(client.status().message(), HasSubstr("sidecar_mode"));
+}
+
 /// @test The sidecar binary option has no meaning in-process and is rejected
 /// rather than silently ignored.
 TEST(InprocClientTest, RejectsSidecarPath) {

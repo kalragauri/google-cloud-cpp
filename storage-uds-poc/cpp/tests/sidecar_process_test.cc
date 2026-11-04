@@ -18,13 +18,16 @@
 #include <chrono>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <fstream>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -106,6 +109,15 @@ void WaitForFile(std::string const& path) {
   }
 }
 
+void WaitForListener(std::string const& socket) {
+  std::chrono::steady_clock::time_point const deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!ProbeSocketListener(socket).has_value() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+}
+
 /// @test An explicitly configured binary wins over the environment and a
 /// non-executable configured path is an error, never a silent fallback.
 TEST(SidecarProcessTest, ResolveConfiguredPath) {
@@ -174,20 +186,27 @@ TEST(SidecarProcessTest, ResolveFromPath) {
 }
 
 /// @test The default socket lives under XDG_RUNTIME_DIR when set, else in a
-/// private per-uid directory under /tmp.
+/// private per-uid directory under /tmp, using a shared name in daemon mode
+/// and a per-pid name in child mode.
 TEST(SidecarProcessTest, DefaultSocketPath) {
   {
     ScopedEnv env("XDG_RUNTIME_DIR", "/run/user/1234");
-    StatusOr<std::string> path = DefaultSocketPath();
-    ASSERT_THAT(path, IsOk());
-    EXPECT_EQ(*path, "/run/user/1234/gcs-core-" + std::to_string(::getpid()) +
-                         ".sock");
+    StatusOr<std::string> daemon = DefaultSocketPath(SidecarMode::kDaemon);
+    ASSERT_THAT(daemon, IsOk());
+    EXPECT_EQ(*daemon, "/run/user/1234/gcs-core.sock");
+    StatusOr<std::string> child = DefaultSocketPath(SidecarMode::kChild);
+    ASSERT_THAT(child, IsOk());
+    EXPECT_EQ(*child, "/run/user/1234/gcs-core-" + std::to_string(::getpid()) +
+                          ".sock");
   }
   ScopedEnv env("XDG_RUNTIME_DIR", std::nullopt);
-  StatusOr<std::string> path = DefaultSocketPath();
-  ASSERT_THAT(path, IsOk());
   std::string const dir = "/tmp/gcs-core-" + std::to_string(::getuid());
-  EXPECT_EQ(*path, dir + "/" + std::to_string(::getpid()) + ".sock");
+  StatusOr<std::string> daemon = DefaultSocketPath(SidecarMode::kDaemon);
+  ASSERT_THAT(daemon, IsOk());
+  EXPECT_EQ(*daemon, dir + "/gcs-core.sock");
+  StatusOr<std::string> child = DefaultSocketPath(SidecarMode::kChild);
+  ASSERT_THAT(child, IsOk());
+  EXPECT_EQ(*child, dir + "/" + std::to_string(::getpid()) + ".sock");
   struct stat st{};
   ASSERT_EQ(::stat(dir.c_str(), &st), 0);
   EXPECT_EQ(st.st_mode & 0777, 0700U);
@@ -213,12 +232,67 @@ std::string TestSocket(std::string_view tag) {
          std::to_string(::getpid()) + ".sock";
 }
 
+/// @test ProbeSocketListener distinguishes an absent path, a stale socket file
+/// whose listener closed, and a live server owned by our UID.
+TEST(SidecarProcessTest, ProbeSocketListenerStates) {
+  std::string const socket = TestSocket("probe");
+  ::unlink(socket.c_str());
+  EXPECT_FALSE(ProbeSocketListener(socket).has_value());
+
+  // Bind a Unix socket without calling listen(), then close it to leave a stale
+  // socket inode on disk.
+  int const fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ASSERT_GE(fd, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::memcpy(addr.sun_path, socket.data(), socket.size());
+  ASSERT_EQ(::bind(fd, reinterpret_cast<sockaddr const*>(&addr), sizeof(addr)),
+            0);
+  ::close(fd);
+  EXPECT_FALSE(ProbeSocketListener(socket).has_value());
+
+  StatusOr<std::unique_ptr<SidecarProcess>> process = SidecarProcess::Spawn(
+      BuiltSidecar(), socket, SidecarMode::kChild, HermeticArgs());
+  ASSERT_THAT(process, IsOk());
+  WaitForListener(socket);
+  EXPECT_EQ(ProbeSocketListener(socket), (*process)->pid());
+  (*process)->Terminate();
+  EXPECT_FALSE(ProbeSocketListener(socket).has_value());
+}
+
+/// @test Detach() leaves a daemon running past ~SidecarProcess() without
+/// deleting its socket, and reaps the child when it later exits so no zombie
+/// lingers.
+TEST(SidecarProcessTest, DetachLeavesDaemonRunningAndReapsOnExit) {
+  std::string const socket = TestSocket("detach");
+  ::unlink(socket.c_str());
+  pid_t pid = 0;
+  {
+    StatusOr<std::unique_ptr<SidecarProcess>> process = SidecarProcess::Spawn(
+        BuiltSidecar(), socket, SidecarMode::kDaemon, HermeticArgs());
+    ASSERT_THAT(process, IsOk());
+    pid = (*process)->pid();
+    WaitForListener(socket);
+    (*process)->Detach();
+  }
+  EXPECT_EQ(ProbeSocketListener(socket), pid);
+
+  ASSERT_EQ(::kill(pid, SIGTERM), 0);
+  std::chrono::steady_clock::time_point const deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (::kill(pid, 0) == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  EXPECT_NE(::kill(pid, 0), 0) << "detached reaper should reap exited daemon";
+  RemoveSocketFiles(socket);
+}
+
 /// @test Terminate() sends SIGTERM first; the server drains, exits 0 well
 /// within the grace period and removes its own socket.
 TEST(SidecarProcessTest, TerminateIsGraceful) {
   std::string const socket = TestSocket("graceful");
-  StatusOr<std::unique_ptr<SidecarProcess>> process =
-      SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
+  StatusOr<std::unique_ptr<SidecarProcess>> process = SidecarProcess::Spawn(
+      BuiltSidecar(), socket, SidecarMode::kChild, HermeticArgs());
   ASSERT_THAT(process, IsOk());
   WaitForFile(socket);
   struct stat st{};
@@ -229,6 +303,7 @@ TEST(SidecarProcessTest, TerminateIsGraceful) {
   std::chrono::steady_clock::duration const elapsed =
       std::chrono::steady_clock::now() - start;
   EXPECT_TRUE((*process)->Exited());
+  EXPECT_EQ((*process)->ExitCode(), 0);
   EXPECT_THAT((*process)->ExitDescription(), HasSubstr("exited with status 0"));
   EXPECT_LT(elapsed, std::chrono::seconds(1));
   EXPECT_NE(::stat(socket.c_str(), &st), 0) << "socket should be removed";
@@ -238,12 +313,13 @@ TEST(SidecarProcessTest, TerminateIsGraceful) {
 /// removes the socket the server could not.
 TEST(SidecarProcessTest, KillIsImmediate) {
   std::string const socket = TestSocket("kill");
-  StatusOr<std::unique_ptr<SidecarProcess>> process =
-      SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
+  StatusOr<std::unique_ptr<SidecarProcess>> process = SidecarProcess::Spawn(
+      BuiltSidecar(), socket, SidecarMode::kChild, HermeticArgs());
   ASSERT_THAT(process, IsOk());
   WaitForFile(socket);
   (*process)->Kill();
   EXPECT_TRUE((*process)->Exited());
+  EXPECT_FALSE((*process)->ExitCode().has_value());
   EXPECT_THAT((*process)->ExitDescription(), HasSubstr("killed by signal 9"));
   struct stat st{};
   EXPECT_NE(::stat(socket.c_str(), &st), 0) << "socket should be removed";
@@ -260,7 +336,8 @@ TEST(SidecarProcessTest, SurvivesSpawningThreadExit) {
   // PR_SET_PDEATHSIG during startup, and a thread that is already gone by
   // then would never trigger it.
   std::thread([&] {
-    process = SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
+    process = SidecarProcess::Spawn(BuiltSidecar(), socket, SidecarMode::kChild,
+                                    HermeticArgs());
     WaitForFile(socket);
   }).join();
   ASSERT_THAT(process, IsOk());
@@ -291,7 +368,8 @@ TEST(SidecarProcessTest, RegularFileSocketPathPreserved) {
               StatusIs(StatusCode::kFailedPrecondition));
   EXPECT_THAT(ValidateSocketPath(link),
               StatusIs(StatusCode::kFailedPrecondition));
-  EXPECT_THAT(SidecarProcess::Spawn(BuiltSidecar(), regular, HermeticArgs()),
+  EXPECT_THAT(SidecarProcess::Spawn(BuiltSidecar(), regular,
+                                    SidecarMode::kChild, HermeticArgs()),
               StatusIs(StatusCode::kFailedPrecondition));
 
   struct stat st{};
@@ -307,7 +385,7 @@ TEST(SidecarProcessTest, ExternalWaitpidReapDoesNotStallTerminate) {
   std::string const socket =
       "/tmp/gcs-core-reap-" + std::to_string(::getpid()) + ".sock";
   StatusOr<std::unique_ptr<SidecarProcess>> process =
-      SidecarProcess::Spawn("/bin/true", socket, {});
+      SidecarProcess::Spawn("/bin/true", socket, SidecarMode::kChild, {});
   ASSERT_THAT(process, IsOk());
 
   int raw_status = 0;

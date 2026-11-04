@@ -66,11 +66,14 @@ struct ObjectMetadata {
   std::int64_t metageneration = 0;
   std::uint64_t size = 0;
   std::string content_type;
+  std::string content_encoding;
   std::optional<std::uint32_t> crc32c;
   /// Only set by `ListObjects`; other calls leave it empty.
   std::string storage_class;
   /// Only set by `ListObjects` (second resolution).
   std::chrono::system_clock::time_point updated;
+  /// True when `AppendableWriter::Finalize(true)` completed over JSON fallback.
+  bool used_json_fallback = false;
 };
 
 struct BucketMetadata {
@@ -99,6 +102,9 @@ struct WriteOptions {
   std::optional<std::uint64_t> size_hint;
   std::string content_type;
   std::optional<std::int64_t> if_generation_match;
+  /// Resumable upload flush buffer size on the server
+  /// (`WriteHeader.chunk_size`); 0 leaves the crate's 8 MiB default.
+  std::uint32_t resumable_buffer_size = 0;
   UploadMode mode = UploadMode::kAuto;
 };
 
@@ -146,12 +152,30 @@ struct SidecarStats {
   std::uint32_t threads = 0;
 };
 
+/// How `gcs_core` (the multiprocess variant) runs `gcs-core-server`.
+enum class SidecarMode {
+  /// Shared per-UID daemon (`--idle-secs=300` unless `--idle-secs` is in
+  /// `sidecar_args`, `--pdeathsig=false`): connects to an already-running
+  /// server on the socket if one is listening, otherwise spawns one and leaves
+  /// it running when this process's last `Client` is destroyed.
+  kDaemon,
+  /// 1:1 child owned by this process (`--pdeathsig=true`, `--idle-secs=0`):
+  /// spawned on a per-process socket and terminated when the last `Client` is
+  /// destroyed (or by the kernel when this process exits).
+  kChild,
+};
+
 struct ClientOptions {
+  /// Multiprocess lifecycle mode. Defaults to the shared per-UID daemon; the
+  /// in-process variant rejects `SidecarMode::kChild`.
+  SidecarMode sidecar_mode = SidecarMode::kDaemon;
   /// Server binary. Empty: `$GCS_CORE_SERVER`, then `gcs-core-server` next to
   /// the running executable, then `gcs-core-server` on `PATH`. Sidecar
   /// variant only; the in-process variant rejects a non-empty value.
   std::string sidecar_path;
-  /// Socket path. Empty: `$XDG_RUNTIME_DIR/gcs-core-<pid>.sock`, else
+  /// Socket path. Empty in `kDaemon` mode: `$XDG_RUNTIME_DIR/gcs-core.sock`,
+  /// else `/tmp/gcs-core-<uid>/gcs-core.sock`. Empty in `kChild` mode:
+  /// `$XDG_RUNTIME_DIR/gcs-core-<pid>.sock`, else
   /// `/tmp/gcs-core-<uid>/<pid>.sock`. Sidecar variant only; the in-process
   /// variant rejects a non-empty value (it binds an abstract socket).
   std::string socket_path;
@@ -212,11 +236,13 @@ class AppendableWriter {
   ~AppendableWriter();
 
   Status Write(absl::Cord const& data);
-  /// Finalizes the object. Fails with `kFailedPrecondition` if the server
-  /// wrote it over JSON instead of `BidiWriteObject` (it does so when the
-  /// bucket rejects appendable objects or when it was built without the
-  /// unstable bidi cfg); the regular object then exists already.
-  StatusOr<ObjectMetadata> Finalize();
+  /// Finalizes the object. When @p allow_json_fallback is false, fails with
+  /// `kFailedPrecondition` if the server wrote it over JSON instead of
+  /// `BidiWriteObject` (it does so when the bucket rejects appendable objects
+  /// or when built without the unstable bidi cfg; the regular object already
+  /// exists by then). When @p allow_json_fallback is true, returns the metadata
+  /// with `used_json_fallback = true`.
+  StatusOr<ObjectMetadata> Finalize(bool allow_json_fallback = false);
   /// Would leave the object appendable. Always `kUnimplemented`: the shared
   /// server's `WriteObject` finalizes when the stream ends.
   StatusOr<std::int64_t> Close();
@@ -259,14 +285,14 @@ class ObjectDescriptor {
 
 class Client {
  public:
-  /// Starts (or reuses) a core matching `(sidecar_path, socket_path,
-  /// sidecar_args, channels)` and waits until it serves.
+  /// Starts (or reuses) a core matching `(sidecar_mode, sidecar_path,
+  /// socket_path, sidecar_args, channels)` and waits until it serves.
   static StatusOr<Client> Create(ClientOptions const& options = {});
 
-  StatusOr<ObjectReader> ReadObject(std::string const& bucket,
-                                    std::string const& object,
-                                    ReadRange range = {},
-                                    std::int64_t generation = 0);
+  StatusOr<ObjectReader> ReadObject(
+      std::string const& bucket, std::string const& object,
+      ReadRange range = {}, std::int64_t generation = 0,
+      std::optional<std::int64_t> if_generation_match = std::nullopt);
   StatusOr<ObjectWriter> WriteObject(std::string const& bucket,
                                      std::string const& object,
                                      WriteOptions const& options = {});
@@ -280,8 +306,10 @@ class Client {
   /// `project` is a project id or number, with or without `projects/`.
   StatusOr<ListBucketsPage> ListBuckets(std::string const& project,
                                         ListBucketsRequest const& request);
-  Status DeleteObject(std::string const& bucket, std::string const& object,
-                      std::int64_t generation = 0);
+  Status DeleteObject(
+      std::string const& bucket, std::string const& object,
+      std::int64_t generation = 0,
+      std::optional<std::int64_t> if_generation_match = std::nullopt);
   StatusOr<ObjectDescriptor> OpenObject(std::string const& bucket,
                                         std::string const& object,
                                         std::int64_t generation = 0);
@@ -290,7 +318,7 @@ class Client {
       WriteOptions const& options = {});
 
   StatusOr<SidecarVersion> GetSidecarVersion();
-  StatusOr<SidecarStats> GetSidecarStats();
+  StatusOr<SidecarStats> GetSidecarStats(bool reset_peak_rss = false);
   /// Pid of the process serving this client's core (this process when the
   /// core runs in-process).
   int sidecar_pid() const;

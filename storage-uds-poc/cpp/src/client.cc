@@ -205,13 +205,22 @@ class Connection {
 
   /// Dispatches one unary RPC on a round-robin channel and checks for crash
   /// restart on `UNAVAILABLE`.
-  /// `served_by`, if set, receives the generation that served the call.
+  template <typename Request, typename Response>
+  Status Unary(grpc::Status (pb::GcsCore::Stub::*method)(grpc::ClientContext*,
+                                                         Request const&,
+                                                         Response*),
+               Request const& request, Response& response) {
+    return Unary(method, request, response, nullptr);
+  }
+
+  /// Like the 3-argument `Unary`, and writes the generation that served the
+  /// call into `*served_by` when non-null.
   template <typename Request, typename Response>
   Status Unary(grpc::Status (pb::GcsCore::Stub::*method)(grpc::ClientContext*,
                                                          Request const&,
                                                          Response*),
                Request const& request, Response& response,
-               std::uint64_t* served_by = nullptr) {
+               std::uint64_t* served_by) {
     std::shared_ptr<StubSet> stubs;
     grpc::ClientContext ctx;
     Status s = FromGrpc((Stub(stubs).*method)(&ctx, request, &response));
@@ -301,7 +310,10 @@ class Connection {
           break;
         }
       }
-      if (all_ready) return {};
+      if (all_ready) {
+        backend_->OnReady();
+        return {};
+      }
     }
     backend_->Kill();
     return Status(
@@ -538,20 +550,23 @@ AppendableWriter::~AppendableWriter() = default;
 Status AppendableWriter::Write(absl::Cord const& data) {
   return impl_->Write(data);
 }
-StatusOr<ObjectMetadata> AppendableWriter::Finalize() {
+StatusOr<ObjectMetadata> AppendableWriter::Finalize(bool allow_json_fallback) {
   StatusOr<pb::WriteObjectResponse> response = impl_->Finish();
   if (!response) return std::move(response).status();
-  // A JSON fallback means the caller measured or relied on something other
-  // than an appendable BidiWriteObject upload; never report it as success.
-  if (response->transport_used() != pb::GRPC) {
+  bool const json_fallback = response->transport_used() != pb::GRPC;
+  // Unless explicitly requested, a JSON fallback means the caller measured or
+  // relied on something other than an appendable BidiWriteObject upload.
+  if (json_fallback && !allow_json_fallback) {
     return Status(StatusCode::kFailedPrecondition,
                   absl::StrCat("server wrote gs://", impl_->bucket(), "/",
                                impl_->object(),
                                " as a regular object over JSON instead of an "
                                "appendable BidiWriteObject upload"));
   }
-  return internal::FromWriteResponse(*response, impl_->bucket(),
-                                     impl_->object());
+  ObjectMetadata meta =
+      internal::FromWriteResponse(*response, impl_->bucket(), impl_->object());
+  meta.used_json_fallback = json_fallback;
+  return meta;
 }
 // NOLINTNEXTLINE(readability-convert-member-functions-to-static): public API
 StatusOr<std::int64_t> AppendableWriter::Close() {
@@ -709,10 +724,9 @@ StatusOr<Client> Client::Create(ClientOptions const& options) {
   return Client(*std::move(conn), options.chunk_size_hint);
 }
 
-StatusOr<ObjectReader> Client::ReadObject(std::string const& bucket,
-                                          std::string const& object,
-                                          ReadRange range,
-                                          std::int64_t generation) {
+StatusOr<ObjectReader> Client::ReadObject(
+    std::string const& bucket, std::string const& object, ReadRange range,
+    std::int64_t generation, std::optional<std::int64_t> if_generation_match) {
   auto const [offset, length] = internal::ToOffsetLength(range);
   pb::ReadObjectRequest request;
   request.set_bucket(bucket);
@@ -720,6 +734,9 @@ StatusOr<ObjectReader> Client::ReadObject(std::string const& bucket,
   request.set_offset(offset);
   request.set_length(length);
   request.set_generation(generation);
+  if (if_generation_match.has_value()) {
+    request.set_if_generation_match(*if_generation_match);
+  }
   request.set_transport(pb::JSON);
   request.set_chunk_size(chunk_size_hint_);
   auto impl = std::make_unique<internal::ReaderImpl>(conn_, bucket, object);
@@ -798,12 +815,15 @@ StatusOr<ListBucketsPage> Client::ListBuckets(
 }
 
 Status Client::DeleteObject(std::string const& bucket,
-                            std::string const& object,
-                            std::int64_t generation) {
+                            std::string const& object, std::int64_t generation,
+                            std::optional<std::int64_t> if_generation_match) {
   pb::DeleteObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
   request.set_generation(generation);
+  if (if_generation_match.has_value()) {
+    request.set_if_generation_match(*if_generation_match);
+  }
   pb::Empty response;
   return conn_->Unary(&pb::GcsCore::Stub::DeleteObject, request, response);
 }
@@ -844,8 +864,10 @@ StatusOr<AppendableWriter> Client::StartAppendableUpload(
 }
 
 namespace {
-StatusOr<pb::StatsResponse> Stats(internal::Connection& conn) {
+StatusOr<pb::StatsResponse> Stats(internal::Connection& conn,
+                                  bool reset_peak_rss) {
   pb::StatsRequest request;
+  request.set_reset_peak_rss(reset_peak_rss);
   pb::StatsResponse response;
   if (Status s = conn.Unary(&pb::GcsCore::Stub::Stats, request, response);
       !s.ok()) {
@@ -860,15 +882,15 @@ std::uint64_t SecondsToMicros(double seconds) {
 }  // namespace
 
 StatusOr<SidecarVersion> Client::GetSidecarVersion() {
-  StatusOr<pb::StatsResponse> stats = Stats(*conn_);
+  StatusOr<pb::StatsResponse> stats = Stats(*conn_, /*reset_peak_rss=*/false);
   if (!stats) return std::move(stats).status();
   SidecarVersion v;
   v.pid = static_cast<std::uint32_t>(stats->pid());
   return v;
 }
 
-StatusOr<SidecarStats> Client::GetSidecarStats() {
-  StatusOr<pb::StatsResponse> stats = Stats(*conn_);
+StatusOr<SidecarStats> Client::GetSidecarStats(bool reset_peak_rss) {
+  StatusOr<pb::StatsResponse> stats = Stats(*conn_, reset_peak_rss);
   if (!stats) return std::move(stats).status();
   SidecarStats out;
   out.user_cpu_us = SecondsToMicros(stats->cpu_user_secs());

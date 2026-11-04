@@ -166,6 +166,11 @@ class InProcessBackend : public CoreBackend {
 StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
     ClientOptions const& options,
     std::vector<std::string> const& /*sockets_in_use*/) {
+  if (options.sidecar_mode != SidecarMode::kDaemon) {
+    return Status(StatusCode::kInvalidArgument,
+                  "ClientOptions::sidecar_mode is not used by the in-process "
+                  "server (it runs inside this process)");
+  }
   if (!options.sidecar_path.empty()) {
     return Status(StatusCode::kInvalidArgument,
                   "ClientOptions::sidecar_path is not used by the in-process "

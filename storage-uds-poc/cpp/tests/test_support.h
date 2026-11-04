@@ -68,6 +68,7 @@ MATCHER_P(StatusIs, code, "status has expected code") {
 /// is off because the wrapper does not use it.
 inline ClientOptions ServerOptions() {
   ClientOptions options;
+  if (!kInProcess) options.sidecar_mode = SidecarMode::kChild;
   options.sidecar_args = {"--endpoint=http://127.0.0.1:1", "--shm-size=0",
                           "--grpc-subchannels=1", "--worker-threads=2"};
   return options;

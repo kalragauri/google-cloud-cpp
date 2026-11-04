@@ -203,11 +203,14 @@ if (GCS_UDS_POC_BUILD_TESTS)
     target_link_libraries(gcs_core_test PRIVATE GTest::gmock_main gcs_core
                                                 gcs_core_protos)
     gcs_uds_poc_warnings(gcs_core_test)
-    add_dependencies(gcs_core_test gcs_core_rust)
+    add_dependencies(gcs_core_test gcs_core_rust cold_start)
     add_test(NAME gcs_core_test COMMAND gcs_core_test)
     set_tests_properties(
-        gcs_core_test PROPERTIES ENVIRONMENT
-                                 "GCS_CORE_SERVER=${GCS_CORE_SERVER_BINARY}")
+        gcs_core_test
+        PROPERTIES
+            ENVIRONMENT
+            "GCS_CORE_SERVER=${GCS_CORE_SERVER_BINARY};GCS_CORE_COLD_START=$<TARGET_FILE:cold_start>"
+    )
 
     # The wrapper against a fake GcsCore: a third backend that connects to a
     # server the test already started, so no Rust server or GCS is involved.

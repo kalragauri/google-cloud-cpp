@@ -17,11 +17,12 @@
 // variant (`cold_start`, `cold_start_inproc`) so a sidecar spawn and an
 // in-process start are measured through the same API call.
 //
-//   cold_start [--channels=N] [--sidecar-arg=ARG]...
+//   cold_start [--channels=N] [--socket-path=PATH] [--child] [--hold-ms=N]
+//              [--sidecar-arg=ARG]...
 //
-// Prints `create_ms=<ms>` and the VmRSS/VmHWM/VmSize/Threads lines of this
-// process (`self`) and, when the core is another process, of that process
-// (`core`).
+// Prints `create_ms=<ms>`, `core_pid=<pid>`, and the VmRSS/VmHWM/VmSize/Threads
+// lines of this process (`self`) and, when the core is another process, of that
+// process (`core`).
 
 #include "absl/strings/match.h"
 #include "gcs_core/client.h"
@@ -29,6 +30,7 @@
 #include <fstream>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <unistd.h>
 
 namespace {
@@ -49,6 +51,7 @@ void PrintStatus(char const* who, int pid) {
 
 int main(int argc, char* argv[]) {
   gcs_core::ClientOptions options;
+  int hold_ms = 0;
   for (int i = 1; i < argc; ++i) {
     std::string const arg = argv[i];
     std::size_t const eq = arg.find('=');
@@ -57,10 +60,17 @@ int main(int argc, char* argv[]) {
         eq == std::string::npos ? std::string() : arg.substr(eq + 1);
     if (key == "--channels") {
       options.channels = std::stoi(val);
+    } else if (key == "--socket-path") {
+      options.socket_path = val;
+    } else if (arg == "--child") {
+      options.sidecar_mode = gcs_core::SidecarMode::kChild;
+    } else if (key == "--hold-ms") {
+      hold_ms = std::stoi(val);
     } else if (key == "--sidecar-arg") {
       options.sidecar_args.push_back(val);
     } else {
-      std::cerr << "usage: cold_start [--channels=N] [--sidecar-arg=ARG]...\n";
+      std::cerr << "usage: cold_start [--channels=N] [--socket-path=PATH] "
+                   "[--child] [--hold-ms=N] [--sidecar-arg=ARG]...\n";
       return 2;
     }
   }
@@ -77,9 +87,14 @@ int main(int argc, char* argv[]) {
   std::cout << "create_ms="
             << std::chrono::duration<double, std::milli>(t1 - t0).count()
             << "\n";
+  std::cout << "core_pid=" << client->sidecar_pid() << "\n";
   PrintStatus("self", ::getpid());
   if (client->sidecar_pid() != ::getpid()) {
     PrintStatus("core", client->sidecar_pid());
+  }
+  std::cout.flush();
+  if (hold_ms > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
   }
   return 0;
 }

@@ -40,6 +40,7 @@ ObjectMetadata FromProto(pb::ObjectMeta const& m, std::string const& bucket,
   out.metageneration = m.metageneration();
   out.size = static_cast<std::uint64_t>(m.size());
   out.content_type = m.content_type();
+  out.content_encoding = m.content_encoding();
   // The server reports 0 when the object has no CRC32C; a real CRC32C of 0 is
   // indistinguishable and treated as absent.
   if (m.crc32c() != 0) out.crc32c = m.crc32c();
@@ -96,8 +97,9 @@ pb::WriteHeader ToWriteHeader(WriteOptions const& options,
     case UploadMode::kResumable:
       break;
   }
-  // `chunk_size` stays 0: it is the crate's resumable buffer (8 MiB default,
+  // `chunk_size` is the crate's resumable buffer (0 leaves its 8 MiB default,
   // the same as the native baseline), not the size of the messages we send.
+  header.set_chunk_size(options.resumable_buffer_size);
   header.set_transport(transport);
   return header;
 }
