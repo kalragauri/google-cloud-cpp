@@ -79,8 +79,17 @@ class CoreBackend {
 /// Validates the backend-specific `ClientOptions` and builds the backend
 /// without starting it. `sockets_in_use` are the socket paths of the live
 /// connections, so a default path can avoid them. Defined once per library
-/// variant (`gcs_core` → sidecar, `gcs_core_inproc` → in-process).
+/// variant (`gcs_core` -> sidecar, `gcs_core_inproc` -> in-process,
+/// `gcs_core_combined` -> dispatched via `ClientOptions::hosting`).
 StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
+    ClientOptions const& options,
+    std::vector<std::string> const& sockets_in_use);
+
+StatusOr<std::unique_ptr<CoreBackend>> MakeSidecarBackend(
+    ClientOptions const& options,
+    std::vector<std::string> const& sockets_in_use);
+
+StatusOr<std::unique_ptr<CoreBackend>> MakeInprocBackend(
     ClientOptions const& options,
     std::vector<std::string> const& sockets_in_use);
 

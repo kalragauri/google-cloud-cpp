@@ -15,6 +15,7 @@
 #include "gcs_core/client.h"
 #include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
+#include "connection.h"
 #include "core_backend.h"
 #include "gcscore.grpc.pb.h"
 #include "status.h"
@@ -31,31 +32,11 @@ namespace internal {
 namespace pb = ::gcscore::v1;
 using ::google::cloud::StatusCode;
 
-namespace {
-
-/// Default and maximum size of one data message sent to the server. Uploads
-/// are framed into messages of this size; the server accepts messages up to
-/// 64 MiB.
-constexpr std::uint32_t kDefaultChunkSize = 1024 * 1024;
-constexpr std::uint32_t kMaxChunkSize = 16 * 1024 * 1024;
-/// Bound on best-effort `CloseObject` during `~ObjectDescriptor()` so a hung
-/// or stopped server cannot stall stack unwinding indefinitely.
-constexpr std::chrono::milliseconds kDescriptorCloseTimeout{500};
-
-constexpr std::uint32_t WriteChunkSize(std::uint32_t chunk_size_hint) {
-  return chunk_size_hint == 0 ? kDefaultChunkSize
-                              : std::min(chunk_size_hint, kMaxChunkSize);
-}
-
-/// `ReadChunk.data` is a vector of slices so the server can forward network
-/// buffers without concatenating them; join them into one Cord.
 absl::Cord JoinSlices(pb::ReadChunk const& chunk) {
   absl::Cord out;
   for (std::string const& slice : chunk.data()) out.Append(slice);
   return out;
 }
-
-}  // namespace
 
 grpc::ChannelArguments LocalChannelArguments(int channel_index) {
   grpc::ChannelArguments args;
@@ -94,398 +75,301 @@ Status ValidateServerFlags(std::vector<std::string> const& args) {
   return {};
 }
 
-/// The stubs of one running server generation. Replaced as a whole on
-/// restart, so a call in flight keeps using the set it started with.
-struct StubSet {
-  std::uint64_t generation = 0;
-  std::vector<std::unique_ptr<pb::GcsCore::Stub>> stubs;
-};
-
-/// One running server (whatever the backend) plus the gRPC channels to it,
-/// shared by `Client` instances whose backends have the same sharing key.
-class Connection {
- public:
-  static StatusOr<std::shared_ptr<Connection>> GetOrCreate(
-      ClientOptions const& options) {
-    if (options.channels < 1) {
-      return Status(StatusCode::kInvalidArgument, "channels must be >= 1");
-    }
-    if (options.readiness_timeout <= std::chrono::milliseconds::zero()) {
-      return Status(StatusCode::kInvalidArgument,
-                    "readiness_timeout must be > 0");
-    }
-
-    static std::mutex mu;
-    static std::vector<std::weak_ptr<Connection>> active;
-    std::scoped_lock lk(mu);
-
-    std::vector<std::shared_ptr<Connection>> live;
-    active.erase(std::remove_if(active.begin(), active.end(),
-                                [&](std::weak_ptr<Connection> const& w) {
-                                  std::shared_ptr<Connection> c = w.lock();
-                                  if (!c) return true;
-                                  live.push_back(std::move(c));
-                                  return false;
-                                }),
-                 active.end());
-
-    std::vector<std::string> sockets_in_use;
-    for (std::shared_ptr<Connection> const& c : live) {
-      if (!c->backend_->SocketPath().empty()) {
-        sockets_in_use.push_back(c->backend_->SocketPath());
-      }
-    }
-    StatusOr<std::unique_ptr<CoreBackend>> backend =
-        MakeCoreBackend(options, sockets_in_use);
-    if (!backend) return std::move(backend).status();
-    for (std::shared_ptr<Connection> const& c : live) {
-      if (c->backend_->SharingKey() == (*backend)->SharingKey()) return c;
-      if (!(*backend)->SocketPath().empty() &&
-          c->backend_->SocketPath() == (*backend)->SocketPath()) {
-        return Status(
-            StatusCode::kFailedPrecondition,
-            absl::StrCat("socket path ", (*backend)->SocketPath(),
-                         " is already in use by a server with different "
-                         "ClientOptions"));
-      }
-    }
-
-    auto conn = std::shared_ptr<Connection>(
-        new Connection(*std::move(backend), options.readiness_timeout));
-    std::scoped_lock clk(conn->mu_);
-    if (Status s = conn->StartLocked(); !s.ok()) return s;
-    active.push_back(conn);
-    return conn;
+StatusOr<std::shared_ptr<Connection>> Connection::GetOrCreate(
+    ClientOptions const& options) {
+  if (options.channels < 1) {
+    return Status(StatusCode::kInvalidArgument, "channels must be >= 1");
+  }
+  if (options.readiness_timeout <= std::chrono::milliseconds::zero()) {
+    return Status(StatusCode::kInvalidArgument,
+                  "readiness_timeout must be > 0");
   }
 
-  ~Connection() {
-    std::scoped_lock lk(mu_);
-    // Our channels first: the server drains open connections before it
-    // stops, and no caller can hold a stub once the last Client is gone.
-    {
-      std::scoped_lock slk(stubs_mu_);
-      stubs_.reset();
+  static std::mutex mu;
+  static std::vector<std::weak_ptr<Connection>> active;
+  std::scoped_lock lk(mu);
+
+  std::vector<std::shared_ptr<Connection>> live;
+  active.erase(std::remove_if(active.begin(), active.end(),
+                              [&](std::weak_ptr<Connection> const& w) {
+                                std::shared_ptr<Connection> c = w.lock();
+                                if (!c) return true;
+                                live.push_back(std::move(c));
+                                return false;
+                              }),
+               active.end());
+
+  std::vector<std::string> sockets_in_use;
+  for (std::shared_ptr<Connection> const& c : live) {
+    if (!c->backend_->SocketPath().empty()) {
+      sockets_in_use.push_back(c->backend_->SocketPath());
     }
-    backend_->Stop();
   }
-
-  /// Round-robin over the channels. `stubs_mu_` only guards copying the
-  /// `shared_ptr` and is never held across an RPC.
-  pb::GcsCore::Stub& Stub(std::shared_ptr<StubSet>& keepalive) {
-    keepalive = CurrentStubs();
-    std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
-    return *keepalive->stubs[i % keepalive->stubs.size()];
-  }
-
-  /// Called after a failed RPC. If the server generation that served this
-  /// RPC died, start a new one once so the next call succeeds; concurrent
-  /// callers failing on the same generation observe the already-bumped
-  /// `generation_` and do not restart a second time.
-  Status Check(Status status, std::uint64_t failed_generation) {
-    if (status.code() != StatusCode::kUnavailable) return status;
-    std::scoped_lock lk(mu_);
-    if (failed_generation != generation_) {
+  StatusOr<std::unique_ptr<CoreBackend>> backend =
+      MakeCoreBackend(options, sockets_in_use);
+  if (!backend) return std::move(backend).status();
+  for (std::shared_ptr<Connection> const& c : live) {
+    if (c->backend_->SharingKey() == (*backend)->SharingKey()) return c;
+    if (!(*backend)->SocketPath().empty() &&
+        c->backend_->SocketPath() == (*backend)->SocketPath()) {
       return Status(
-          StatusCode::kUnavailable,
-          absl::StrCat("server restarted after failure: ", status.message()));
+          StatusCode::kFailedPrecondition,
+          absl::StrCat("socket path ", (*backend)->SocketPath(),
+                       " is already in use by a server with different "
+                       "ClientOptions"));
     }
-    if (backend_->Exited()) {
-      std::string const why = backend_->ExitDescription();
-      // The stubs stay in place until StartLocked replaces them, so a
-      // concurrent caller never observes an empty set.
-      backend_->Stop();
-      if (Status s = StartLocked(); !s.ok()) return s;
-      return Status(
-          StatusCode::kUnavailable,
-          absl::StrCat(backend_->Describe(), " ", why,
-                       "; restarted it for the next call: ", status.message()));
-    }
-    return status;
   }
 
-  /// Dispatches one unary RPC on a round-robin channel and checks for crash
-  /// restart on `UNAVAILABLE`.
-  template <typename Request, typename Response>
-  Status Unary(grpc::Status (pb::GcsCore::Stub::*method)(grpc::ClientContext*,
-                                                         Request const&,
-                                                         Response*),
-               Request const& request, Response& response) {
-    return Unary(method, request, response, nullptr);
+  auto conn = std::shared_ptr<Connection>(
+      new Connection(*std::move(backend), options.readiness_timeout));
+  std::scoped_lock clk(conn->mu_);
+  if (Status s = conn->StartLocked(); !s.ok()) return s;
+  active.push_back(conn);
+  return conn;
+}
+
+Connection::~Connection() {
+  std::scoped_lock lk(mu_);
+  // Our channels first: the server drains open connections before it
+  // stops, and no caller can hold a stub once the last Client is gone.
+  {
+    std::scoped_lock slk(stubs_mu_);
+    stubs_.reset();
   }
+  backend_->Stop();
+}
 
-  /// Like the 3-argument `Unary`, and writes the generation that served the
-  /// call into `*served_by` when non-null.
-  template <typename Request, typename Response>
-  Status Unary(grpc::Status (pb::GcsCore::Stub::*method)(grpc::ClientContext*,
-                                                         Request const&,
-                                                         Response*),
-               Request const& request, Response& response,
-               std::uint64_t* served_by) {
-    std::shared_ptr<StubSet> stubs;
-    grpc::ClientContext ctx;
-    Status s = FromGrpc((Stub(stubs).*method)(&ctx, request, &response));
-    if (served_by != nullptr) *served_by = stubs->generation;
-    if (!s.ok()) return Check(std::move(s), stubs->generation);
-    return {};
-  }
+pb::GcsCore::Stub& Connection::Stub(std::shared_ptr<StubSet>& keepalive) {
+  keepalive = CurrentStubs();
+  std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
+  return *keepalive->stubs[i % keepalive->stubs.size()];
+}
 
-  /// Like `Stub()`, but only while `generation` is still the running server.
-  /// Server-side handles are small counters that restart at 1, so a handle
-  /// from a server that has since been restarted would name an unrelated
-  /// object in the new one; callers holding such a handle get nullptr.
-  pb::GcsCore::Stub* StubFor(std::uint64_t generation,
-                             std::shared_ptr<StubSet>& keepalive) {
-    keepalive = CurrentStubs();
-    if (!keepalive || keepalive->generation != generation) return nullptr;
-    std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
-    return keepalive->stubs[i % keepalive->stubs.size()].get();
-  }
-
-  int pid() const {
-    std::scoped_lock lk(mu_);
-    return backend_->pid();
-  }
-
-  std::optional<std::uint64_t> CoreThreadCpuMicros() const {
-    std::scoped_lock lk(mu_);
-    return backend_->CoreThreadCpuMicros();
-  }
-
-  void KillForTesting() {
-    std::scoped_lock lk(mu_);
-    backend_->Kill();
-  }
-
- private:
-  Connection(std::unique_ptr<CoreBackend> backend,
-             std::chrono::milliseconds readiness_timeout)
-      : backend_(std::move(backend)), readiness_timeout_(readiness_timeout) {}
-
-  std::shared_ptr<StubSet> CurrentStubs() const {
-    std::scoped_lock lk(stubs_mu_);
-    return stubs_;
-  }
-
-  Status StartLocked() {
-    StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> channels =
-        backend_->Start();
-    if (!channels) return std::move(channels).status();
-    auto set = std::make_shared<StubSet>();
-    set->generation = ++generation_;
-    for (std::shared_ptr<grpc::Channel>& channel : *channels) {
-      set->stubs.push_back(pb::GcsCore::NewStub(std::move(channel)));
-    }
-    {
-      std::scoped_lock slk(stubs_mu_);
-      stubs_ = set;
-    }
-    return WaitUntilReadyLocked(*set);
-  }
-
-  Status WaitUntilReadyLocked(StubSet const& set) {
-    std::chrono::steady_clock::time_point const deadline =
-        std::chrono::steady_clock::now() + readiness_timeout_;
-    Status last;
-    while (std::chrono::steady_clock::now() < deadline) {
-      if (backend_->Exited()) {
-        return Status(
-            StatusCode::kFailedPrecondition,
-            absl::StrCat(backend_->Describe(), " ", backend_->ExitDescription(),
-                         " before becoming ready"));
-      }
-      // Every channel must be connected, so the first measured call does not
-      // pay connection setup.
-      bool all_ready = true;
-      for (std::unique_ptr<pb::GcsCore::Stub> const& stub : set.stubs) {
-        grpc::ClientContext ctx;
-        ctx.set_wait_for_ready(true);
-        ctx.set_deadline(std::chrono::system_clock::now() +
-                         std::chrono::milliseconds(200));
-        pb::PingRequest request;
-        pb::PingResponse response;
-        Status s = FromGrpc(stub->Ping(&ctx, request, &response));
-        if (!s.ok()) {
-          last = std::move(s);
-          all_ready = false;
-          break;
-        }
-      }
-      if (all_ready) {
-        backend_->OnReady();
-        return {};
-      }
-    }
-    backend_->Kill();
+Status Connection::Check(Status status, std::uint64_t failed_generation) {
+  if (status.code() != StatusCode::kUnavailable) return status;
+  std::scoped_lock lk(mu_);
+  if (failed_generation != generation_) {
     return Status(
-        StatusCode::kDeadlineExceeded,
-        absl::StrCat(backend_->Describe(), " did not become ready within ",
-                     readiness_timeout_.count(),
-                     "ms; last error: ", last.message()));
+        StatusCode::kUnavailable,
+        absl::StrCat("server restarted after failure: ", status.message()));
   }
+  if (backend_->Exited()) {
+    std::string const why = backend_->ExitDescription();
+    // The stubs stay in place until StartLocked replaces them, so a
+    // concurrent caller never observes an empty set.
+    backend_->Stop();
+    if (Status s = StartLocked(); !s.ok()) return s;
+    return Status(
+        StatusCode::kUnavailable,
+        absl::StrCat(backend_->Describe(), " ", why,
+                     "; restarted it for the next call: ", status.message()));
+  }
+  return status;
+}
 
-  std::unique_ptr<CoreBackend> const backend_;
-  std::chrono::milliseconds const readiness_timeout_;
-  mutable std::mutex mu_;
-  std::uint64_t generation_ = 0;
-  mutable std::mutex stubs_mu_;
-  std::shared_ptr<StubSet> stubs_;
-  std::atomic<std::size_t> next_{0};
-};
+pb::GcsCore::Stub* Connection::StubFor(std::uint64_t generation,
+                                       std::shared_ptr<StubSet>& keepalive) {
+  keepalive = CurrentStubs();
+  if (!keepalive || keepalive->generation != generation) return nullptr;
+  std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
+  return keepalive->stubs[i % keepalive->stubs.size()].get();
+}
+
+int Connection::pid() const {
+  std::scoped_lock lk(mu_);
+  return backend_->pid();
+}
+
+std::optional<std::uint64_t> Connection::CoreThreadCpuMicros() const {
+  std::scoped_lock lk(mu_);
+  return backend_->CoreThreadCpuMicros();
+}
+
+void Connection::KillForTesting() {
+  std::scoped_lock lk(mu_);
+  backend_->Kill();
+}
+
+Connection::Connection(std::unique_ptr<CoreBackend> backend,
+                       std::chrono::milliseconds readiness_timeout)
+    : backend_(std::move(backend)), readiness_timeout_(readiness_timeout) {}
+
+std::shared_ptr<StubSet> Connection::CurrentStubs() const {
+  std::scoped_lock lk(stubs_mu_);
+  return stubs_;
+}
+
+Status Connection::StartLocked() {
+  StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> channels =
+      backend_->Start();
+  if (!channels) return std::move(channels).status();
+  auto set = std::make_shared<StubSet>();
+  set->generation = ++generation_;
+  for (std::shared_ptr<grpc::Channel>& channel : *channels) {
+    set->stubs.push_back(pb::GcsCore::NewStub(std::move(channel)));
+  }
+  {
+    std::scoped_lock slk(stubs_mu_);
+    stubs_ = set;
+  }
+  return WaitUntilReadyLocked(*set);
+}
+
+Status Connection::WaitUntilReadyLocked(StubSet const& set) {
+  std::chrono::steady_clock::time_point const deadline =
+      std::chrono::steady_clock::now() + readiness_timeout_;
+  Status last;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (backend_->Exited()) {
+      return Status(
+          StatusCode::kFailedPrecondition,
+          absl::StrCat(backend_->Describe(), " ", backend_->ExitDescription(),
+                       " before becoming ready"));
+    }
+    // Every channel must be connected, so the first measured call does not
+    // pay connection setup.
+    bool all_ready = true;
+    for (std::unique_ptr<pb::GcsCore::Stub> const& stub : set.stubs) {
+      grpc::ClientContext ctx;
+      ctx.set_wait_for_ready(true);
+      ctx.set_deadline(std::chrono::system_clock::now() +
+                       std::chrono::milliseconds(200));
+      pb::PingRequest request;
+      pb::PingResponse response;
+      Status s = FromGrpc(stub->Ping(&ctx, request, &response));
+      if (!s.ok()) {
+        // Peer-credential rejection (`SO_PEERCRED` on another user's socket) is
+        // terminal: fail fast without killing the peer's daemon (row B9).
+        if (s.code() == StatusCode::kPermissionDenied ||
+            s.code() == StatusCode::kUnauthenticated) {
+          return s;
+        }
+        last = std::move(s);
+        all_ready = false;
+        break;
+      }
+    }
+    if (all_ready) {
+      backend_->OnReady();
+      return {};
+    }
+  }
+  backend_->Kill();
+  return Status(
+      StatusCode::kDeadlineExceeded,
+      absl::StrCat(backend_->Describe(), " did not become ready within ",
+                   readiness_timeout_.count(),
+                   "ms; last error: ", last.message()));
+}
 
 void KillCoreForTesting(Client const& client) {
   client.conn_->KillForTesting();
 }
 
-namespace {
-/// Splits `data` into messages of at most `chunk` bytes. `Cord::Subcord`
-/// shares the underlying buffers, so no bytes are copied here.
-template <typename Fn>
-bool ForEachChunk(absl::Cord const& data, std::size_t chunk, Fn&& fn) {
-  for (std::size_t offset = 0; offset < data.size(); offset += chunk) {
-    if (!fn(data.Subcord(offset, chunk))) return false;
+ReaderImpl::ReaderImpl(std::shared_ptr<Connection> conn, std::string bucket,
+                       std::string object)
+    : conn_(std::move(conn)),
+      bucket_(std::move(bucket)),
+      object_(std::move(object)) {}
+
+ReaderImpl::~ReaderImpl() {
+  if (reader_ && !done_) {
+    context_.TryCancel();
+    pb::ReadChunk discard;
+    while (reader_->Read(&discard)) {
+    }
+    (void)reader_->Finish();
   }
-  return true;
 }
-}  // namespace
 
-class ReaderImpl {
- public:
-  ReaderImpl(std::shared_ptr<Connection> conn, std::string bucket,
-             std::string object)
-      : conn_(std::move(conn)),
-        bucket_(std::move(bucket)),
-        object_(std::move(object)) {}
-  ~ReaderImpl() {
-    if (reader_ && !done_) {
-      context_.TryCancel();
-      pb::ReadChunk discard;
-      while (reader_->Read(&discard)) {
-      }
-      (void)reader_->Finish();
-    }
-  }
-
-  Status Start(pb::ReadObjectRequest const& request) {
-    reader_ = conn_->Stub(stubs_).ReadObject(&context_, request);
-    pb::ReadChunk first;
-    if (!reader_->Read(&first)) {
-      done_ = true;
-      Status s = FromGrpc(reader_->Finish());
-      if (s.ok()) {
-        return Status(StatusCode::kInternal,
-                      "server closed ReadObject without metadata");
-      }
-      return conn_->Check(std::move(s), stubs_->generation);
-    }
-    metadata_ = FromProto(first.meta(), bucket_, object_);
-    absl::Cord data = JoinSlices(first);
-    if (!data.empty()) pending_ = std::move(data);
-    return {};
-  }
-
-  ObjectMetadata const& metadata() const { return metadata_; }
-
-  StatusOr<std::optional<absl::Cord>> Next() {
-    if (pending_) {
-      std::optional<absl::Cord> out = std::move(pending_);
-      pending_.reset();
-      return out;
-    }
-    if (done_) return std::optional<absl::Cord>{};
-    pb::ReadChunk message;
-    while (reader_->Read(&message)) {
-      absl::Cord data = JoinSlices(message);
-      if (!data.empty()) return std::optional<absl::Cord>(std::move(data));
-    }
+Status ReaderImpl::Start(pb::ReadObjectRequest const& request) {
+  reader_ = conn_->Stub(stubs_).ReadObject(&context_, request);
+  pb::ReadChunk first;
+  if (!reader_->Read(&first)) {
     done_ = true;
     Status s = FromGrpc(reader_->Finish());
-    if (!s.ok()) return conn_->Check(std::move(s), stubs_->generation);
-    return std::optional<absl::Cord>{};
-  }
-
- private:
-  std::shared_ptr<Connection> conn_;
-  std::string bucket_;
-  std::string object_;
-  std::shared_ptr<StubSet> stubs_;
-  grpc::ClientContext context_;
-  std::unique_ptr<grpc::ClientReader<pb::ReadChunk>> reader_;
-  ObjectMetadata metadata_;
-  std::optional<absl::Cord> pending_;
-  bool done_ = false;
-};
-
-/// One client-streaming `WriteObject`: a header message, then data messages.
-/// Used for regular and appendable uploads; the header's transport selects
-/// which one the server performs.
-class WriterImpl {
- public:
-  WriterImpl(std::shared_ptr<Connection> conn, pb::WriteHeader header,
-             std::uint32_t chunk_size_hint)
-      : conn_(std::move(conn)),
-        header_(std::move(header)),
-        write_chunk_size_(WriteChunkSize(chunk_size_hint)) {
-    writer_ = conn_->Stub(stubs_).WriteObject(&context_, &response_);
-  }
-  ~WriterImpl() {
-    // Cancelling makes the server fail the upload instead of finalizing a
-    // partial object.
-    if (writer_ && !finished_) {
-      context_.TryCancel();
-      (void)writer_->Finish();
+    if (s.ok()) {
+      return Status(StatusCode::kInternal,
+                    "server closed ReadObject without metadata");
     }
+    return conn_->Check(std::move(s), stubs_->generation);
   }
+  metadata_ = FromProto(first.meta(), bucket_, object_);
+  absl::Cord data = JoinSlices(first);
+  if (!data.empty()) pending_ = std::move(data);
+  return {};
+}
 
-  std::string const& bucket() const { return header_.bucket(); }
-  std::string const& object() const { return header_.object(); }
-
-  Status Write(absl::Cord const& data) {
-    if (finished_) {
-      return Status(StatusCode::kFailedPrecondition, "upload already closed");
-    }
-    bool const ok =
-        SendHeader() &&
-        ForEachChunk(data, write_chunk_size_, [&](absl::Cord const& chunk) {
-          pb::WriteRequest request;
-          request.set_data(std::string(chunk));
-          return writer_->Write(request);
-        });
-    // A failed Write means the stream is broken; Finish reports why.
-    if (!ok) return Finish().status();
-    return {};
+StatusOr<std::optional<absl::Cord>> ReaderImpl::Next() {
+  if (pending_) {
+    std::optional<absl::Cord> out = std::move(pending_);
+    pending_.reset();
+    return out;
   }
-
-  StatusOr<pb::WriteObjectResponse> Finish() {
-    if (finished_) {
-      return Status(StatusCode::kFailedPrecondition, "upload already closed");
-    }
-    (void)SendHeader();
-    (void)writer_->WritesDone();
-    finished_ = true;
-    Status s = FromGrpc(writer_->Finish());
-    if (!s.ok()) return conn_->Check(std::move(s), stubs_->generation);
-    return response_;
+  if (done_) return std::optional<absl::Cord>{};
+  pb::ReadChunk message;
+  while (reader_->Read(&message)) {
+    absl::Cord data = JoinSlices(message);
+    if (!data.empty()) return std::optional<absl::Cord>(std::move(data));
   }
+  done_ = true;
+  Status s = FromGrpc(reader_->Finish());
+  if (!s.ok()) return conn_->Check(std::move(s), stubs_->generation);
+  return std::optional<absl::Cord>{};
+}
 
- private:
-  bool SendHeader() {
-    if (header_sent_) return true;
-    header_sent_ = true;
-    pb::WriteRequest request;
-    *request.mutable_header() = header_;
-    return writer_->Write(request);
+WriterImpl::WriterImpl(std::shared_ptr<Connection> conn, pb::WriteHeader header,
+                       std::uint32_t chunk_size_hint)
+    : conn_(std::move(conn)),
+      header_(std::move(header)),
+      write_chunk_size_(WriteChunkSize(chunk_size_hint)) {
+  writer_ = conn_->Stub(stubs_).WriteObject(&context_, &response_);
+}
+
+WriterImpl::~WriterImpl() {
+  // Cancelling makes the server fail the upload instead of finalizing a
+  // partial object.
+  if (writer_ && !finished_) {
+    context_.TryCancel();
+    (void)writer_->Finish();
   }
+}
 
-  std::shared_ptr<Connection> conn_;
-  std::shared_ptr<StubSet> stubs_;
-  pb::WriteHeader header_;
-  std::size_t write_chunk_size_;
-  grpc::ClientContext context_;
-  pb::WriteObjectResponse response_;
-  std::unique_ptr<grpc::ClientWriter<pb::WriteRequest>> writer_;
-  bool header_sent_ = false;
-  bool finished_ = false;
-};
+Status WriterImpl::Write(absl::Cord const& data) {
+  if (finished_) {
+    return Status(StatusCode::kFailedPrecondition, "upload already closed");
+  }
+  bool const ok =
+      SendHeader() &&
+      ForEachChunk(data, write_chunk_size_, [&](absl::Cord const& chunk) {
+        pb::WriteRequest request;
+        request.set_data(std::string(chunk));
+        return writer_->Write(request);
+      });
+  // A failed Write means the stream is broken; Finish reports why.
+  if (!ok) return Finish().status();
+  return {};
+}
+
+StatusOr<pb::WriteObjectResponse> WriterImpl::Finish() {
+  if (finished_) {
+    return Status(StatusCode::kFailedPrecondition, "upload already closed");
+  }
+  (void)SendHeader();
+  (void)writer_->WritesDone();
+  finished_ = true;
+  Status s = FromGrpc(writer_->Finish());
+  if (!s.ok()) return conn_->Check(std::move(s), stubs_->generation);
+  return response_;
+}
+
+bool WriterImpl::SendHeader() {
+  if (header_sent_) return true;
+  header_sent_ = true;
+  pb::WriteRequest request;
+  *request.mutable_header() = header_;
+  return writer_->Write(request);
+}
 
 namespace {
 ObjectMetadata FromWriteResponse(pb::WriteObjectResponse const& r,

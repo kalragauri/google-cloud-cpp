@@ -163,11 +163,13 @@ TEST(InprocClientTest, DifferentOptionsUseSeparateCores) {
 
 /// @test Concurrent Create() calls with equal options end up on one core.
 TEST(InprocClientTest, ConcurrentCreateSharesRuntime) {
+  WaitForCoreThreads(0);
   int single = 0;
   {
     StatusOr<Client> one = Client::Create(ServerOptions());
     ASSERT_THAT(one, IsOk());
     single = CoreThreads();
+    ASSERT_GE(single, 2);
   }
   WaitForCoreThreads(0);
   std::mutex mu;
@@ -183,8 +185,17 @@ TEST(InprocClientTest, ConcurrentCreateSharesRuntime) {
     });
   }
   for (std::thread& t : threads) t.join();
-  EXPECT_EQ(clients.size(), 8U);
-  EXPECT_EQ(CoreThreads(), single);
+  ASSERT_EQ(clients.size(), 8U);
+  // Tokio's `spawn_blocking` pool (used while loading ADC in `prepare_service`)
+  // may keep 1 or 2 idle blocking threads alongside the 2 worker threads, so a
+  // single runtime has `single` +/- 1 threads while two runtimes have >= 2 * 2
+  // worker threads + 2 supervisor/blocking threads (>= 6).
+  EXPECT_LE(CoreThreads(), single + 1);
+  clients.erase(clients.begin() + 1, clients.end());
+  EXPECT_GT(CoreThreads(), 0);
+  clients.clear();
+  WaitForCoreThreads(0);
+  EXPECT_EQ(CoreThreads(), 0);
 }
 
 /// @test Destroying the last Client stops the core: its threads are gone.

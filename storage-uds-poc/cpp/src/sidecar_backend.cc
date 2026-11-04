@@ -211,9 +211,14 @@ class SidecarBackend : public CoreBackend {
 
 }  // namespace
 
-StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
+StatusOr<std::unique_ptr<CoreBackend>> MakeSidecarBackend(
     ClientOptions const& options,
     std::vector<std::string> const& sockets_in_use) {
+  if (options.hosting == HostingMode::kInProcess) {
+    return Status(google::cloud::StatusCode::kInvalidArgument,
+                  "ClientOptions::hosting is kInProcess, which is not "
+                  "available in the sidecar-only library");
+  }
   StatusOr<std::string> binary = ResolveSidecarPath(options.sidecar_path);
   if (!binary) return std::move(binary).status();
   if (Status s = ValidateServerFlags(options.sidecar_args); !s.ok()) return s;

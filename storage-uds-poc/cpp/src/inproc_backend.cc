@@ -163,9 +163,14 @@ class InProcessBackend : public CoreBackend {
 
 }  // namespace
 
-StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
+StatusOr<std::unique_ptr<CoreBackend>> MakeInprocBackend(
     ClientOptions const& options,
     std::vector<std::string> const& /*sockets_in_use*/) {
+  if (options.hosting == HostingMode::kSidecar) {
+    return Status(StatusCode::kInvalidArgument,
+                  "ClientOptions::hosting is kSidecar, which is not available "
+                  "in the in-process-only library");
+  }
   if (options.sidecar_mode != SidecarMode::kDaemon) {
     return Status(StatusCode::kInvalidArgument,
                   "ClientOptions::sidecar_mode is not used by the in-process "

@@ -152,6 +152,19 @@ struct SidecarStats {
   std::uint32_t threads = 0;
 };
 
+/// Where the shared Rust server runs when using a combined multi-backend build
+/// (`gcs_core_combined` / `gcs_core_storage_combined`). Single-backend
+/// libraries (`gcs_core` and `gcs_core_inproc`) default to their own backend
+/// when `ClientOptions::hosting` is unset and reject the other value with
+/// `kInvalidArgument`.
+enum class HostingMode {
+  /// Separate OS process (`gcs-core-server`) over a filesystem `unix:` socket.
+  kSidecar,
+  /// Tokio runtime threads inside this process (`libstorage_grpc_uds.a`) over
+  /// an abstract-namespace `unix-abstract:` socket.
+  kInProcess,
+};
+
 /// How `gcs_core` (the multiprocess variant) runs `gcs-core-server`.
 enum class SidecarMode {
   /// Shared per-UID daemon (`--idle-secs=300` unless `--idle-secs` is in
@@ -166,6 +179,10 @@ enum class SidecarMode {
 };
 
 struct ClientOptions {
+  /// Selects the hosting backend when linked against a combined library;
+  /// `std::nullopt` uses the library's default (`kSidecar` in `gcs_core` and
+  /// `gcs_core_combined`, `kInProcess` in `gcs_core_inproc`).
+  std::optional<HostingMode> hosting;
   /// Multiprocess lifecycle mode. Defaults to the shared per-UID daemon; the
   /// in-process variant rejects `SidecarMode::kChild`.
   SidecarMode sidecar_mode = SidecarMode::kDaemon;

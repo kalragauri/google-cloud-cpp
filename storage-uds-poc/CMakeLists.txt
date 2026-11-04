@@ -100,12 +100,14 @@ add_custom_target(
     gcs_core_rust ALL
     COMMAND
         ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${GCS_CORE_CARGO_TARGET_DIR}"
+        "PROTOC=$<TARGET_FILE:protobuf::protoc>"
         "RUSTFLAGS=--cfg google_cloud_unstable_storage_bidi"
         ${GCS_UDS_POC_CARGO} build --release --quiet -p storage-grpc-uds
     COMMAND
         ${CMAKE_COMMAND} -E copy_if_different
         "${GCS_CORE_CARGO_TARGET_DIR}/release/gcs-core-server"
         "${GCS_CORE_SERVER_BINARY}"
+    DEPENDS protobuf::protoc
     WORKING_DIRECTORY "${google_cloud_rust_SOURCE_DIR}"
     BYPRODUCTS "${GCS_CORE_SERVER_BINARY}" "${GCS_CORE_RUST_STATICLIB}"
     COMMENT "cargo build --release -p storage-grpc-uds"
@@ -134,14 +136,25 @@ target_include_directories(gcs_core_protos SYSTEM
 target_link_libraries(gcs_core_protos PUBLIC gRPC::grpc++
                                              protobuf::libprotobuf)
 
-# --- the thin wrapper, sidecar variant -----------------------------------------
+# --- the thin wrapper and public SDK adapters, sidecar variant ----------------
 # Everything above the backend seam (`cpp/src/core_backend.h`) is the same
-# source in both variants; only the backend translation unit differs.
-set(GCS_CORE_WRAPPER_SOURCES cpp/include/gcs_core/client.h cpp/src/client.cc
-                             cpp/src/core_backend.h cpp/src/status.cc
-                             cpp/src/status.h)
-add_library(gcs_core ${GCS_CORE_WRAPPER_SOURCES} cpp/src/sidecar_backend.cc
-                     cpp/src/sidecar_process.cc cpp/src/sidecar_process.h)
+# source in every variant; only the backend translation unit differs.
+set(GCS_CORE_WRAPPER_SOURCES
+    cpp/include/gcs_core/client.h
+    cpp/src/client.cc
+    cpp/src/connection.h
+    cpp/src/core_backend.h
+    cpp/src/status.cc
+    cpp/src/status.h)
+set(GCS_CORE_ADAPTER_SOURCES
+    cpp/include/gcs_core/storage_client.h cpp/src/async_connection.cc
+    cpp/src/storage_connection.cc)
+
+add_library(
+    gcs_core
+    ${GCS_CORE_WRAPPER_SOURCES} cpp/src/sidecar_backend.cc
+    cpp/src/sidecar_only_backend.cc cpp/src/sidecar_process.cc
+    cpp/src/sidecar_process.h)
 target_include_directories(gcs_core PUBLIC cpp/include PRIVATE cpp/src)
 target_link_libraries(
     gcs_core
@@ -149,15 +162,23 @@ target_link_libraries(
     PRIVATE gRPC::grpc++ gcs_core_protos)
 gcs_uds_poc_warnings(gcs_core)
 
+add_library(gcs_core_storage ${GCS_CORE_ADAPTER_SOURCES})
+target_include_directories(gcs_core_storage PUBLIC cpp/include PRIVATE cpp/src)
+target_link_libraries(
+    gcs_core_storage
+    PUBLIC gcs_core google-cloud-cpp::storage google-cloud-cpp::storage_grpc
+    PRIVATE gRPC::grpc++ gcs_core_protos)
+gcs_uds_poc_warnings(gcs_core_storage)
+
 add_executable(quickstart cpp/examples/quickstart.cc)
-target_link_libraries(quickstart PRIVATE gcs_core)
+target_link_libraries(quickstart PRIVATE gcs_core_storage)
 gcs_uds_poc_warnings(quickstart)
 # Cold start of Client::Create() in a fresh process (packaging probes).
 add_executable(cold_start cpp/examples/cold_start.cc)
 target_link_libraries(cold_start PRIVATE gcs_core)
 gcs_uds_poc_warnings(cold_start)
 
-# --- the shared server as a static library, and the in-process variant --------
+# --- the shared server as a static library, in-process & combined variants ----
 if (GCS_UDS_POC_BUILD_INPROC)
     add_library(gcs_core_rust_lib STATIC IMPORTED)
     set_target_properties(gcs_core_rust_lib PROPERTIES IMPORTED_LOCATION
@@ -165,12 +186,13 @@ if (GCS_UDS_POC_BUILD_INPROC)
     target_include_directories(gcs_core_rust_lib
                                INTERFACE "${GCS_CORE_RUST_CRATE_DIR}/include")
     # From `rustc --print native-static-libs` for this crate.
-    target_link_libraries(gcs_core_rust_lib INTERFACE gcc_s util rt pthread m
-                                                      dl)
+    target_link_libraries(gcs_core_rust_lib INTERFACE dl gcc_s m pthread rt
+                                                      util)
     add_dependencies(gcs_core_rust_lib gcs_core_rust)
 
     add_library(gcs_core_inproc ${GCS_CORE_WRAPPER_SOURCES}
-                                cpp/src/inproc_backend.cc)
+                                cpp/src/inproc_backend.cc
+                                cpp/src/inproc_only_backend.cc)
     target_include_directories(gcs_core_inproc PUBLIC cpp/include
                                PRIVATE cpp/src)
     target_link_libraries(
@@ -179,8 +201,39 @@ if (GCS_UDS_POC_BUILD_INPROC)
         PRIVATE gRPC::grpc++ gcs_core_protos gcs_core_rust_lib)
     gcs_uds_poc_warnings(gcs_core_inproc)
 
+    add_library(gcs_core_storage_inproc ${GCS_CORE_ADAPTER_SOURCES})
+    target_include_directories(gcs_core_storage_inproc PUBLIC cpp/include
+                               PRIVATE cpp/src)
+    target_link_libraries(
+        gcs_core_storage_inproc
+        PUBLIC gcs_core_inproc google-cloud-cpp::storage
+               google-cloud-cpp::storage_grpc
+        PRIVATE gRPC::grpc++ gcs_core_protos)
+    gcs_uds_poc_warnings(gcs_core_storage_inproc)
+
+    # Dispatches between `MakeSidecarBackend` and `MakeInprocBackend` via
+    # `ClientOptions::hosting` so a single benchmark binary can drive all
+    # comparators.
+    add_library(
+        gcs_core_storage_combined
+        ${GCS_CORE_ADAPTER_SOURCES}
+        ${GCS_CORE_WRAPPER_SOURCES}
+        cpp/src/combined_backend.cc
+        cpp/src/inproc_backend.cc
+        cpp/src/sidecar_backend.cc
+        cpp/src/sidecar_process.cc
+        cpp/src/sidecar_process.h)
+    target_include_directories(gcs_core_storage_combined PUBLIC cpp/include
+                               PRIVATE cpp/src)
+    target_link_libraries(
+        gcs_core_storage_combined
+        PUBLIC absl::cord absl::status absl::strings google-cloud-cpp::common
+               google-cloud-cpp::storage google-cloud-cpp::storage_grpc
+        PRIVATE gRPC::grpc++ gcs_core_protos gcs_core_rust_lib)
+    gcs_uds_poc_warnings(gcs_core_storage_combined)
+
     add_executable(quickstart_inproc cpp/examples/quickstart.cc)
-    target_link_libraries(quickstart_inproc PRIVATE gcs_core_inproc)
+    target_link_libraries(quickstart_inproc PRIVATE gcs_core_storage_inproc)
     gcs_uds_poc_warnings(quickstart_inproc)
     add_executable(cold_start_inproc cpp/examples/cold_start.cc)
     target_link_libraries(cold_start_inproc PRIVATE gcs_core_inproc)
@@ -193,8 +246,8 @@ if (GCS_UDS_POC_BUILD_TESTS)
     # The shared tests are compiled once per variant; `test_support.h` picks
     # the few expectations that legitimately differ. They start the real
     # shared server without GCS access and cover its lifecycle only; the
-    # data plane is covered by gcs_core_fake_test and, end to end, by the
-    # quickstart against real buckets.
+    # data plane is covered by gcs_core_fake_test / gcs_core_adapter_fake_test
+    # and, end to end, by the quickstart against real buckets.
     add_executable(gcs_core_test cpp/tests/client_common_test.cc
                                  cpp/tests/client_sidecar_test.cc
                                  cpp/tests/sidecar_process_test.cc
@@ -212,8 +265,9 @@ if (GCS_UDS_POC_BUILD_TESTS)
             "GCS_CORE_SERVER=${GCS_CORE_SERVER_BINARY};GCS_CORE_COLD_START=$<TARGET_FILE:cold_start>"
     )
 
-    # The wrapper against a fake GcsCore: a third backend that connects to a
-    # server the test already started, so no Rust server or GCS is involved.
+    # The wrapper and public SDK adapters against a fake GcsCore: a backend
+    # that connects to a server the test already started, so no Rust server or
+    # GCS is involved.
     add_library(gcs_core_testing STATIC ${GCS_CORE_WRAPPER_SOURCES}
                                         cpp/tests/existing_server_backend.cc)
     target_include_directories(gcs_core_testing PUBLIC cpp/include
@@ -229,6 +283,22 @@ if (GCS_UDS_POC_BUILD_TESTS)
                                                      gcs_core_testing)
     gcs_uds_poc_warnings(gcs_core_fake_test)
     add_test(NAME gcs_core_fake_test COMMAND gcs_core_fake_test)
+
+    add_library(gcs_core_storage_testing STATIC ${GCS_CORE_ADAPTER_SOURCES})
+    target_include_directories(gcs_core_storage_testing PUBLIC cpp/include
+                               PRIVATE cpp/src)
+    target_link_libraries(
+        gcs_core_storage_testing
+        PUBLIC gcs_core_testing google-cloud-cpp::storage
+               google-cloud-cpp::storage_grpc)
+    gcs_uds_poc_warnings(gcs_core_storage_testing)
+    add_executable(gcs_core_adapter_fake_test cpp/tests/adapter_fake_test.cc
+                                              cpp/tests/test_support.h)
+    target_link_libraries(gcs_core_adapter_fake_test
+                          PRIVATE GTest::gmock_main gcs_core_storage_testing)
+    gcs_uds_poc_warnings(gcs_core_adapter_fake_test)
+    add_test(NAME gcs_core_adapter_fake_test COMMAND gcs_core_adapter_fake_test)
+
     if (GCS_UDS_POC_BUILD_INPROC)
         add_executable(gcs_core_inproc_test cpp/tests/client_common_test.cc
                                             cpp/tests/client_inproc_test.cc
