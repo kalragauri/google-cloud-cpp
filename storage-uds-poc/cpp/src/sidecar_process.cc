@@ -16,11 +16,15 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_split.h"
 #include <cerrno>
+#include <condition_variable>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
+#include <future>
+#include <mutex>
 #include <thread>
-#include <fcntl.h>
 #include <spawn.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -34,9 +38,6 @@ namespace {
 using ::google::cloud::Status;
 using ::google::cloud::StatusCode;
 using ::google::cloud::StatusOr;
-
-/// The child sees the lifetime pipe at this descriptor.
-constexpr int kChildLifetimeFd = 3;
 
 bool IsExecutableFile(std::string const& path) {
   struct stat st{};
@@ -56,6 +57,51 @@ std::string ExecutableDirectory() {
   buf.resize(static_cast<std::size_t>(n));
   std::size_t const slash = buf.rfind('/');
   return slash == std::string::npos ? std::string{} : buf.substr(0, slash);
+}
+
+/// A thread that lives as long as the process and runs spawn requests, so
+/// the parent-death signal the server requests is tied to it (see
+/// `SidecarProcess`). Leaked on purpose: destroying it at exit would end the
+/// thread, and with it, every server it spawned that is still running.
+class SpawnerThread {
+ public:
+  static SpawnerThread& Instance() {
+    static auto* instance = new SpawnerThread;
+    return *instance;
+  }
+
+  int Run(std::function<int()> fn) {
+    std::packaged_task<int()> task(std::move(fn));
+    std::future<int> result = task.get_future();
+    {
+      std::scoped_lock lk(mu_);
+      queue_.push_back(std::move(task));
+    }
+    cv_.notify_one();
+    return result.get();
+  }
+
+ private:
+  SpawnerThread() {
+    std::thread([this] {
+      for (;;) {
+        std::unique_lock lk(mu_);
+        cv_.wait(lk, [this] { return !queue_.empty(); });
+        std::packaged_task<int()> task = std::move(queue_.front());
+        queue_.pop_front();
+        lk.unlock();
+        task();
+      }
+    }).detach();
+  }
+
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<std::packaged_task<int()>> queue_;
+};
+
+int RunOnSpawnerThread(std::function<int()> fn) {
+  return SpawnerThread::Instance().Run(std::move(fn));
 }
 
 }  // namespace
@@ -138,51 +184,29 @@ StatusOr<std::unique_ptr<SidecarProcess>> SidecarProcess::Spawn(
     std::string const& binary, std::string const& socket_path,
     std::vector<std::string> const& extra_args) {
   if (Status s = ValidateSocketPath(socket_path); !s.ok()) return s;
-  int fds[2];
-  if (::pipe2(fds, O_CLOEXEC) != 0) return Errno("pipe2");
-  int read_fd = fds[0];
-  int const write_fd = fds[1];
-  // dup2(fd, fd) would keep O_CLOEXEC set, closing the pipe at exec.
-  if (read_fd == kChildLifetimeFd) {
-    read_fd = ::fcntl(fds[0], F_DUPFD_CLOEXEC, kChildLifetimeFd + 1);
-    ::close(fds[0]);
-    if (read_fd < 0) {
-      ::close(write_fd);
-      return Errno("fcntl");
-    }
-  }
-
-  std::vector<std::string> args = {
-      binary, absl::StrCat("--socket=", socket_path),
-      absl::StrCat("--parent-fd=", kChildLifetimeFd)};
+  std::vector<std::string> args = {binary,
+                                   absl::StrCat("--socket=", socket_path),
+                                   "--pdeathsig=true", "--idle-secs=0"};
   args.insert(args.end(), extra_args.begin(), extra_args.end());
   std::vector<char*> argv;
   argv.reserve(args.size() + 1);
   for (std::string& a : args) argv.push_back(a.data());
   argv.push_back(nullptr);
 
-  posix_spawn_file_actions_t actions;
-  posix_spawn_file_actions_init(&actions);
-  posix_spawn_file_actions_adddup2(&actions, read_fd, kChildLifetimeFd);
   pid_t pid = 0;
-  int const rc = ::posix_spawn(&pid, binary.c_str(), &actions, nullptr,
-                               argv.data(), environ);
-  posix_spawn_file_actions_destroy(&actions);
-  ::close(read_fd);
+  int const rc = RunOnSpawnerThread([&] {
+    return ::posix_spawn(&pid, binary.c_str(), nullptr, nullptr, argv.data(),
+                         environ);
+  });
   if (rc != 0) {
-    ::close(write_fd);
     errno = rc;
     return Errno(absl::StrCat("posix_spawn ", binary));
   }
-  return std::unique_ptr<SidecarProcess>(
-      new SidecarProcess(pid, write_fd, socket_path));
+  return std::unique_ptr<SidecarProcess>(new SidecarProcess(pid, socket_path));
 }
 
-SidecarProcess::SidecarProcess(pid_t pid, int lifetime_fd,
-                               std::string socket_path)
-    : pid_(pid),
-      lifetime_fd_(lifetime_fd),
-      socket_path_(std::move(socket_path)) {}
+SidecarProcess::SidecarProcess(pid_t pid, std::string socket_path)
+    : pid_(pid), socket_path_(std::move(socket_path)) {}
 
 SidecarProcess::~SidecarProcess() { Terminate(); }
 
@@ -221,21 +245,33 @@ bool SidecarProcess::WaitFor(std::chrono::milliseconds timeout) {
 void SidecarProcess::Terminate() { Terminate(std::chrono::seconds(2)); }
 
 void SidecarProcess::Terminate(std::chrono::milliseconds grace) {
-  if (lifetime_fd_ >= 0) {
-    ::close(lifetime_fd_);  // The sidecar sees EOF and shuts down gracefully.
-    lifetime_fd_ = -1;
-  }
-  if (!WaitFor(grace)) {
-    ::kill(pid_, SIGTERM);
-    if (!WaitFor(std::chrono::seconds(2))) {
+  if (!Exited()) {
+    ::kill(pid_, SIGTERM);  // The server drains in-flight RPCs and exits.
+    if (!WaitFor(grace)) {
       ::kill(pid_, SIGKILL);
       WaitFor(std::chrono::seconds(5));
     }
   }
-  // Remove only a Unix socket file (never a regular file or symlink).
-  struct stat st{};
-  if (::lstat(socket_path_.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) {
-    ::unlink(socket_path_.c_str());
+  RemoveSocketFiles();
+}
+
+void SidecarProcess::Kill() {
+  if (!Exited()) {
+    ::kill(pid_, SIGKILL);
+    WaitFor(std::chrono::seconds(5));
+  }
+  RemoveSocketFiles();
+}
+
+void SidecarProcess::RemoveSocketFiles() const {
+  // A graceful exit removes both; after SIGKILL they are left behind. Remove
+  // only Unix socket files (never a regular file or symlink).
+  for (std::string const& path :
+       {socket_path_, absl::StrCat(socket_path_, ".shm")}) {
+    struct stat st{};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISSOCK(st.st_mode)) {
+      ::unlink(path.c_str());
+    }
   }
 }
 

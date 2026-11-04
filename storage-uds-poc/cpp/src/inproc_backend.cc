@@ -12,18 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The thread-boundary backend: the core runs on tokio threads inside this
-// process (`libgcs_core.a`, see `gcs_core_inproc.h`), and each channel is
-// either one end of a `socketpair` or a connection to an abstract-namespace
-// socket, depending on the core's `--link` argument.
+// The thread-boundary backend: the shared server runs on Tokio threads
+// inside this process (`libstorage_grpc_uds.a`, `gcs_core_uds.h`) and listens
+// on an abstract-namespace Unix socket, so nothing appears on the filesystem
+// and the channels are the same gRPC-over-UDS channels the sidecar uses.
 
+#include "absl/strings/match.h"
+#include "absl/strings/numbers.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
+#include "absl/strings/str_split.h"
 #include "core_backend.h"
-#include "gcs_core/inproc.h"
-#include "gcs_core_inproc.h"
-#include <grpcpp/create_channel_posix.h>
-#include <mutex>
+#include "gcs_core_uds.h"
+#include <atomic>
+#include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <unistd.h>
 
 namespace gcs_core {
@@ -32,32 +36,43 @@ namespace {
 
 using ::google::cloud::StatusCode;
 
-/// How long `Stop()` lets the server drain in-flight RPCs and the runtime
-/// wind down, each.
-constexpr std::uint64_t kStopGraceMs = 2000;
+/// The server names its runtime threads this (15 bytes, the kernel limit),
+/// which is how their CPU time is found among this process's threads.
+constexpr std::string_view kCoreThreadName = "gcs-core-inproc";
 
-std::mutex& HooksMutex() {
-  static std::mutex mu;
-  return mu;
-}
-
-inproc::ThreadHooks& GlobalHooks() {
-  static inproc::ThreadHooks hooks;
-  return hooks;
-}
-
-/// Reads a string-returning ABI function into a std::string, growing the
-/// buffer if the first call reports a longer text.
-template <typename Fn>
-std::string ReadString(Fn&& fn) {
-  std::string out(256, '\0');
-  std::size_t n = fn(out.data(), out.size());
-  if (n >= out.size()) {
-    out.assign(n + 1, '\0');
-    n = fn(out.data(), out.size());
+/// User + system CPU of this process's threads named `kCoreThreadName`, in
+/// microseconds, from `/proc/self/task/<tid>/stat` (fields 14 and 15, clock
+/// ticks).
+std::uint64_t CoreThreadCpuMicrosNow() {
+  static std::int64_t const kTicksPerSecond = ::sysconf(_SC_CLK_TCK);
+  std::uint64_t ticks = 0;
+  std::error_code ec;
+  for (std::filesystem::directory_entry const& task :
+       std::filesystem::directory_iterator("/proc/self/task", ec)) {
+    std::ifstream comm(task.path() / "comm");
+    std::string name;
+    std::getline(comm, name);
+    if (name != kCoreThreadName) continue;
+    std::ifstream stat_file(task.path() / "stat");
+    std::stringstream buffer;
+    buffer << stat_file.rdbuf();
+    std::string const stat = buffer.str();
+    // `comm` (field 2) may contain spaces; the fields after it start past the
+    // last ')'.
+    std::size_t const close = stat.rfind(')');
+    if (close == std::string::npos) continue;
+    std::vector<std::string_view> fields =
+        absl::StrSplit(std::string_view(stat).substr(close + 2), ' ');
+    // fields[0] is field 3 (state), so utime/stime are fields[11]/fields[12].
+    std::uint64_t utime = 0;
+    std::uint64_t stime = 0;
+    if (fields.size() > 12 && absl::SimpleAtoi(fields[11], &utime) &&
+        absl::SimpleAtoi(fields[12], &stime)) {
+      ticks += utime + stime;
+    }
   }
-  out.resize(n);
-  return out;
+  if (kTicksPerSecond <= 0) return 0;
+  return ticks * 1000000 / static_cast<std::uint64_t>(kTicksPerSecond);
 }
 
 class InProcessBackend : public CoreBackend {
@@ -77,100 +92,72 @@ class InProcessBackend : public CoreBackend {
   }
 
   StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> Start() override {
+    // A fresh name per start: a restarted server never meets connections
+    // that were meant for the previous one.
+    static std::atomic<std::uint64_t> next_seq{0};
+    name_ = absl::StrCat("gcs-core-", ::getpid(), "-", ++next_seq);
+    std::string const socket = absl::StrCat("@", name_);
+    std::vector<std::string> flags = {"--socket", socket};
+    flags.insert(flags.end(), args_.begin(), args_.end());
     std::vector<char const*> argv;
-    argv.reserve(args_.size());
-    for (std::string const& a : args_) argv.push_back(a.c_str());
-    GcsCoreThreadHooks hooks{};
-    {
-      std::scoped_lock lk(HooksMutex());
-      hooks.on_start = GlobalHooks().on_start;
-      hooks.on_stop = GlobalHooks().on_stop;
-      hooks.data = GlobalHooks().data;
-    }
-    core_ = gcs_core_inproc_start(argv.data(), argv.size(),
-                                  static_cast<std::size_t>(channels_), &hooks);
-    if (core_ == nullptr) {
-      std::string const why = ReadString(gcs_core_inproc_last_error);
-      // Kind 1 is an argument error (nothing was started), everything else a
-      // failure to bring the core up — the same two codes the sidecar
-      // variant uses for a bad flag and for a child that exits early.
-      StatusCode const code = gcs_core_inproc_last_error_kind() == 1
+    argv.reserve(flags.size());
+    for (std::string const& f : flags) argv.push_back(f.c_str());
+    if (gcs_core_start_inproc_with_args(static_cast<int>(argv.size()),
+                                        argv.data()) != 0) {
+      std::string why(gcs_core_inproc_last_error(nullptr, 0) + 1, '\0');
+      why.resize(gcs_core_inproc_last_error(why.data(), why.size()));
+      name_.clear();
+      // Flag errors are the caller's; everything else is a failure to bring
+      // the server up.
+      StatusCode const code = absl::StrContains(why, "flags")
                                   ? StatusCode::kInvalidArgument
                                   : StatusCode::kFailedPrecondition;
-      return Status(code, absl::StrCat("in-process core: ", why));
+      return Status(code, absl::StrCat("in-process server: ", why));
     }
+    running_ = true;
     std::vector<std::shared_ptr<grpc::Channel>> channels;
     channels.reserve(static_cast<std::size_t>(channels_));
-    if (gcs_core_inproc_link_kind(core_) == 0) {
-      for (int i = 0; i != channels_; ++i) {
-        int const fd =
-            gcs_core_inproc_take_channel_fd(core_, static_cast<std::size_t>(i));
-        if (fd < 0) {
-          Kill();
-          return Status(StatusCode::kInternal,
-                        absl::StrCat("in-process core handed out no socket "
-                                     "for channel ",
-                                     i));
-        }
-        // gRPC owns `fd` from here and closes it with the channel.
-        channels.push_back(grpc::CreateCustomInsecureChannelFromFd(
-            "gcs-core-inproc", fd, LocalChannelArguments(i)));
-      }
-    } else {
-      std::string const target =
-          "unix-abstract:" + ReadString([&](char* buf, std::size_t cap) {
-            return gcs_core_inproc_abstract_name(core_, buf, cap);
-          });
-      for (int i = 0; i != channels_; ++i) {
-        channels.push_back(grpc::CreateCustomChannel(
-            target, grpc::InsecureChannelCredentials(),
-            LocalChannelArguments(i)));
-      }
+    for (int i = 0; i != channels_; ++i) {
+      channels.push_back(grpc::CreateCustomChannel(
+          absl::StrCat("unix-abstract:", name_),
+          grpc::InsecureChannelCredentials(), LocalChannelArguments(i)));
     }
     return channels;
   }
 
-  bool Exited() override {
-    return core_ == nullptr || gcs_core_inproc_alive(core_) == 0;
-  }
-
+  /// The server lives as long as its runtime thread; there is no crash that
+  /// leaves this process running, so it only "exits" when stopped.
+  bool Exited() override { return !running_; }
   std::string ExitDescription() override {
-    if (core_ == nullptr) return "not running";
-    return ReadString([&](char* buf, std::size_t cap) {
-      return gcs_core_inproc_status(core_, buf, cap);
-    });
+    return running_ ? "running" : "stopped";
   }
 
   void Stop() override {
-    if (core_ == nullptr) return;
-    retired_cpu_us_ += gcs_core_inproc_core_cpu_us(core_);
-    gcs_core_inproc_stop(core_, kStopGraceMs);
-    core_ = nullptr;
+    if (!running_) return;
+    retired_cpu_us_ += CoreThreadCpuMicrosNow();
+    (void)gcs_core_stop_inproc(absl::StrCat("@", name_).c_str());
+    running_ = false;
   }
 
-  void Kill() override {
-    if (core_ == nullptr) return;
-    retired_cpu_us_ += gcs_core_inproc_core_cpu_us(core_);
-    gcs_core_inproc_kill(core_);
-    core_ = nullptr;
-  }
+  /// The shared server has no abort entry point; stopping drains in-flight
+  /// RPCs, which ends their streams with an error just as a crash would.
+  void Kill() override { Stop(); }
 
   int pid() const override { return ::getpid(); }
-  std::string Describe() const override { return "in-process core"; }
+  std::string Describe() const override { return "in-process server"; }
 
   std::optional<std::uint64_t> CoreThreadCpuMicros() const override {
-    std::uint64_t const live =
-        core_ == nullptr ? 0 : gcs_core_inproc_core_cpu_us(core_);
-    return retired_cpu_us_ + live;
+    return retired_cpu_us_ + (running_ ? CoreThreadCpuMicrosNow() : 0);
   }
 
  private:
   std::vector<std::string> const args_;
   int const channels_;
   std::string const key_;
-  GcsCoreInproc* core_ = nullptr;
-  /// CPU of earlier instances of this backend (before a restart), so a delta
-  /// across a restart never goes backwards.
+  std::string name_;
+  bool running_ = false;
+  /// CPU of earlier instances (before a restart), so a delta across a
+  /// restart never goes backwards.
   std::uint64_t retired_cpu_us_ = 0;
 };
 
@@ -182,25 +169,17 @@ StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
   if (!options.sidecar_path.empty()) {
     return Status(StatusCode::kInvalidArgument,
                   "ClientOptions::sidecar_path is not used by the in-process "
-                  "core (the core is linked into this program)");
+                  "server (it is linked into this program)");
   }
   if (!options.socket_path.empty()) {
     return Status(StatusCode::kInvalidArgument,
                   "ClientOptions::socket_path is not used by the in-process "
-                  "core (channels are socket pairs inside this process)");
+                  "server (it binds an abstract socket)");
   }
+  if (Status s = ValidateServerFlags(options.sidecar_args); !s.ok()) return s;
   return std::unique_ptr<CoreBackend>(
       new InProcessBackend(options.sidecar_args, options.channels));
 }
 
 }  // namespace internal
-
-namespace inproc {
-
-void SetThreadHooks(ThreadHooks hooks) {
-  std::scoped_lock lk(internal::HooksMutex());
-  internal::GlobalHooks() = hooks;
-}
-
-}  // namespace inproc
 }  // namespace gcs_core

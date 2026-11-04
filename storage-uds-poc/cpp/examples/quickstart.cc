@@ -249,11 +249,7 @@ int main(int argc, char* argv[]) {
   }
   gcs_core::StatusOr<gcs_core::SidecarVersion> version =
       client->GetSidecarVersion();
-  if (version) {
-    std::cout << "sidecar pid=" << version->pid
-              << " crate=" << version->storage_crate_version
-              << " bidi=" << version->bidi_enabled << "\n";
-  }
+  if (version) std::cout << "server pid=" << version->pid << "\n";
   if (zonal) {
     Zonal(*client, bucket);
   } else {

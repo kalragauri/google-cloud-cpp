@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GCS SDK consolidation POC: thin C++ wrapper over a Rust core-sdk, built in
-# two variants that differ only in where the core runs — a sidecar process
-# reached over a Unix domain socket (`gcs_core`) or tokio threads inside the
-# application reached over socket pairs (`gcs_core_inproc`) — plus the native
-# google-cloud-cpp baseline.
+# GCS SDK consolidation POC: thin C++ wrapper over the shared Rust
+# gRPC-over-UDS server (`storage-grpc-uds` in google-cloud-rust), built in two
+# variants that differ only in where the server runs — a child process reached
+# over a Unix domain socket (`gcs_core`) or Tokio threads inside the
+# application reached over an abstract Unix socket (`gcs_core_inproc`) — plus
+# the native google-cloud-cpp baseline.
 #
 # This is a standalone project. It is NOT referenced by the repository's root
 # CMakeLists.txt, so it never affects the library build or its CI.
@@ -49,8 +50,7 @@ function (gcs_uds_poc_warnings target)
 endfunction ()
 
 option(GCS_UDS_POC_BUILD_TESTS "Build the wrapper unit tests" ON)
-option(GCS_UDS_POC_BUILD_INPROC
-       "Build the in-process variant (needs cargo; see sidecar/)" ON)
+option(GCS_UDS_POC_BUILD_INPROC "Build the in-process variant" ON)
 
 # google-cloud-cpp from this checkout: `common` for the wrapper, `storage` and
 # `storage_grpc` for the native baseline. EXCLUDE_FROM_ALL builds only what is
@@ -67,17 +67,59 @@ find_package(gRPC CONFIG REQUIRED)
 find_package(Protobuf CONFIG REQUIRED)
 find_package(absl CONFIG REQUIRED)
 
-# --- gcs.core.v0 protos -----------------------------------------------------
-set(GCS_UDS_POC_PROTO_DIR "${CMAKE_CURRENT_LIST_DIR}/proto")
-set(GCS_UDS_POC_PROTO "${GCS_UDS_POC_PROTO_DIR}/gcs/core/v0/storage_core.proto")
+# --- the shared Rust server (google-cloud-rust, storage-grpc-uds) -------------
+# Every language's POC uses the same server: PR #7350's `storage-grpc-uds`
+# crate plus the follow-up commits on our `grpc-uds-cpp` branch. Nothing is
+# copied into this tree; the checkout is fetched and built by cargo. For local
+# iteration point CMake at a worktree instead of fetching:
+#   -DFETCHCONTENT_SOURCE_DIR_GOOGLE_CLOUD_RUST=$HOME/google-cloud-rust-grpc-uds-cpp
+include(FetchContent)
+set(GCS_CORE_RUST_REPO "https://github.com/kalragauri/google-cloud-rust.git"
+    CACHE STRING "google-cloud-rust repository providing storage-grpc-uds")
+set(GCS_CORE_RUST_REF "grpc-uds-cpp"
+    CACHE STRING "Commit SHA (preferred) or branch of GCS_CORE_RUST_REPO")
+FetchContent_Declare(
+    google_cloud_rust
+    GIT_REPOSITORY "${GCS_CORE_RUST_REPO}"
+    GIT_TAG "${GCS_CORE_RUST_REF}"
+    GIT_SHALLOW FALSE)
+# The repository has no top-level CMakeLists.txt, so this only populates it.
+FetchContent_MakeAvailable(google_cloud_rust)
+set(GCS_CORE_RUST_CRATE_DIR "${google_cloud_rust_SOURCE_DIR}/src/storage/grpc-uds")
+
+find_program(GCS_UDS_POC_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin" REQUIRED)
+set(GCS_CORE_CARGO_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/cargo-target")
+set(GCS_CORE_SERVER_BINARY "${CMAKE_CURRENT_BINARY_DIR}/gcs-core-server")
+set(GCS_CORE_RUST_STATICLIB
+    "${GCS_CORE_CARGO_TARGET_DIR}/release/libstorage_grpc_uds.a")
+# One cargo build produces the server binary (sidecar variant) and the static
+# library (in-process variant). Appendable writes need the unstable bidi cfg.
+# cargo tracks its own inputs, so the target runs every build and is a no-op
+# when nothing changed.
+add_custom_target(
+    gcs_core_rust ALL
+    COMMAND
+        ${CMAKE_COMMAND} -E env "CARGO_TARGET_DIR=${GCS_CORE_CARGO_TARGET_DIR}"
+        "RUSTFLAGS=--cfg google_cloud_unstable_storage_bidi"
+        ${GCS_UDS_POC_CARGO} build --release --quiet -p storage-grpc-uds
+    COMMAND
+        ${CMAKE_COMMAND} -E copy_if_different
+        "${GCS_CORE_CARGO_TARGET_DIR}/release/gcs-core-server"
+        "${GCS_CORE_SERVER_BINARY}"
+    WORKING_DIRECTORY "${google_cloud_rust_SOURCE_DIR}"
+    BYPRODUCTS "${GCS_CORE_SERVER_BINARY}" "${GCS_CORE_RUST_STATICLIB}"
+    COMMENT "cargo build --release -p storage-grpc-uds"
+    VERBATIM)
+
+# --- gcscore.v1 protos (the shared wire contract) ----------------------------
+set(GCS_UDS_POC_PROTO_DIR "${GCS_CORE_RUST_CRATE_DIR}/proto")
+set(GCS_UDS_POC_PROTO "${GCS_UDS_POC_PROTO_DIR}/gcscore.proto")
 set(GCS_UDS_POC_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/gen")
-set(GCS_UDS_POC_GEN_SRCS
-    "${GCS_UDS_POC_GEN_DIR}/gcs/core/v0/storage_core.pb.cc"
-    "${GCS_UDS_POC_GEN_DIR}/gcs/core/v0/storage_core.grpc.pb.cc")
+set(GCS_UDS_POC_GEN_SRCS "${GCS_UDS_POC_GEN_DIR}/gcscore.pb.cc"
+                         "${GCS_UDS_POC_GEN_DIR}/gcscore.grpc.pb.cc")
 add_custom_command(
-    OUTPUT ${GCS_UDS_POC_GEN_SRCS}
-           "${GCS_UDS_POC_GEN_DIR}/gcs/core/v0/storage_core.pb.h"
-           "${GCS_UDS_POC_GEN_DIR}/gcs/core/v0/storage_core.grpc.pb.h"
+    OUTPUT ${GCS_UDS_POC_GEN_SRCS} "${GCS_UDS_POC_GEN_DIR}/gcscore.pb.h"
+           "${GCS_UDS_POC_GEN_DIR}/gcscore.grpc.pb.h"
     COMMAND ${CMAKE_COMMAND} -E make_directory "${GCS_UDS_POC_GEN_DIR}"
     COMMAND
         $<TARGET_FILE:protobuf::protoc> --proto_path=${GCS_UDS_POC_PROTO_DIR}
@@ -115,36 +157,19 @@ add_executable(cold_start cpp/examples/cold_start.cc)
 target_link_libraries(cold_start PRIVATE gcs_core)
 gcs_uds_poc_warnings(cold_start)
 
-# --- the Rust core as a static library, and the in-process variant ------------
-# One `cargo build` produces the sidecar binary, the pure-Rust comparator and
-# `libgcs_core.a`; cargo tracks its own inputs, so the target runs every build
-# and is a no-op when nothing changed. `protoc` comes from the vcpkg tree.
+# --- the shared server as a static library, and the in-process variant --------
 if (GCS_UDS_POC_BUILD_INPROC)
-    find_program(GCS_UDS_POC_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin"
-                 REQUIRED)
-    set(GCS_UDS_POC_CARGO_DIR "${CMAKE_CURRENT_LIST_DIR}/sidecar")
-    set(GCS_UDS_POC_RUST_STATICLIB
-        "${GCS_UDS_POC_CARGO_DIR}/target/release/libgcs_core.a")
-    add_custom_target(
-        gcs_core_rust ALL
-        COMMAND ${CMAKE_COMMAND} -E env PROTOC=$<TARGET_FILE:protobuf::protoc>
-                ${GCS_UDS_POC_CARGO} build --release --quiet
-        WORKING_DIRECTORY "${GCS_UDS_POC_CARGO_DIR}"
-        BYPRODUCTS "${GCS_UDS_POC_RUST_STATICLIB}"
-        COMMENT "cargo build --release (sidecar, gcs-core-bench, libgcs_core.a)"
-        VERBATIM)
     add_library(gcs_core_rust_lib STATIC IMPORTED)
-    set_target_properties(
-        gcs_core_rust_lib PROPERTIES IMPORTED_LOCATION
-                                     "${GCS_UDS_POC_RUST_STATICLIB}")
+    set_target_properties(gcs_core_rust_lib PROPERTIES IMPORTED_LOCATION
+                                                       "${GCS_CORE_RUST_STATICLIB}")
+    target_include_directories(gcs_core_rust_lib
+                               INTERFACE "${GCS_CORE_RUST_CRATE_DIR}/include")
     # From `rustc --print native-static-libs` for this crate.
     target_link_libraries(gcs_core_rust_lib INTERFACE gcc_s util rt pthread m
                                                       dl)
     add_dependencies(gcs_core_rust_lib gcs_core_rust)
 
     add_library(gcs_core_inproc ${GCS_CORE_WRAPPER_SOURCES}
-                                cpp/include/gcs_core/inproc.h
-                                cpp/src/gcs_core_inproc.h
                                 cpp/src/inproc_backend.cc)
     target_include_directories(gcs_core_inproc PUBLIC cpp/include
                                PRIVATE cpp/src)
@@ -166,7 +191,10 @@ if (GCS_UDS_POC_BUILD_TESTS)
     find_package(GTest CONFIG REQUIRED)
     enable_testing()
     # The shared tests are compiled once per variant; `test_support.h` picks
-    # the few expectations that legitimately differ.
+    # the few expectations that legitimately differ. They start the real
+    # shared server without GCS access and cover its lifecycle only; the
+    # data plane is covered by gcs_core_fake_test and, end to end, by the
+    # quickstart against real buckets.
     add_executable(gcs_core_test cpp/tests/client_common_test.cc
                                  cpp/tests/client_sidecar_test.cc
                                  cpp/tests/sidecar_process_test.cc
@@ -175,14 +203,29 @@ if (GCS_UDS_POC_BUILD_TESTS)
     target_link_libraries(gcs_core_test PRIVATE GTest::gmock_main gcs_core
                                                 gcs_core_protos)
     gcs_uds_poc_warnings(gcs_core_test)
+    add_dependencies(gcs_core_test gcs_core_rust)
     add_test(NAME gcs_core_test COMMAND gcs_core_test)
-    # The tests start the real sidecar in --synthetic mode.
     set_tests_properties(
-        gcs_core_test
-        PROPERTIES
-            ENVIRONMENT
-            "GCS_CORE_SIDECAR=${CMAKE_CURRENT_LIST_DIR}/sidecar/target/release/gcs-core-sidecar"
-    )
+        gcs_core_test PROPERTIES ENVIRONMENT
+                                 "GCS_CORE_SERVER=${GCS_CORE_SERVER_BINARY}")
+
+    # The wrapper against a fake GcsCore: a third backend that connects to a
+    # server the test already started, so no Rust server or GCS is involved.
+    add_library(gcs_core_testing STATIC ${GCS_CORE_WRAPPER_SOURCES}
+                                        cpp/tests/existing_server_backend.cc)
+    target_include_directories(gcs_core_testing PUBLIC cpp/include
+                               PRIVATE cpp/src)
+    target_link_libraries(
+        gcs_core_testing
+        PUBLIC absl::cord absl::status absl::strings google-cloud-cpp::common
+               gRPC::grpc++ gcs_core_protos)
+    gcs_uds_poc_warnings(gcs_core_testing)
+    add_executable(gcs_core_fake_test cpp/tests/client_fake_test.cc
+                                      cpp/tests/test_support.h)
+    target_link_libraries(gcs_core_fake_test PRIVATE GTest::gmock_main
+                                                     gcs_core_testing)
+    gcs_uds_poc_warnings(gcs_core_fake_test)
+    add_test(NAME gcs_core_fake_test COMMAND gcs_core_fake_test)
     if (GCS_UDS_POC_BUILD_INPROC)
         add_executable(gcs_core_inproc_test cpp/tests/client_common_test.cc
                                             cpp/tests/client_inproc_test.cc
@@ -199,4 +242,10 @@ if (GCS_UDS_POC_BUILD_TESTS)
 endif ()
 
 # --- benchmarks -----------------------------------------------------------------
-add_subdirectory(bench)
+# The phase-1 harness measured the wrapper's own API; the worklog's workloads
+# are measured through the unmodified google-cloud-cpp clients instead (plan
+# rev 4, step S3), so it stays off until it is ported.
+option(GCS_UDS_POC_BUILD_BENCH "Build the benchmark binaries" OFF)
+if (GCS_UDS_POC_BUILD_BENCH)
+    add_subdirectory(bench)
+endif ()

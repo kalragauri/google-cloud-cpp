@@ -13,36 +13,46 @@
 // limitations under the License.
 
 #include "gcs_core/client.h"
+#include "absl/strings/match.h"
 #include "absl/strings/str_cat.h"
 #include "core_backend.h"
-#include "gcs/core/v0/storage_core.grpc.pb.h"
+#include "gcscore.grpc.pb.h"
 #include "status.h"
 #include <grpcpp/grpcpp.h>
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <thread>
 
 namespace gcs_core {
 namespace internal {
 
-namespace v0 = ::gcs::core::v0;
+namespace pb = ::gcscore::v1;
 using ::google::cloud::StatusCode;
 
 namespace {
 
-/// Default and maximum size of one data message sent to the core. Uploads
-/// are framed into messages of this size, matching `service::MAX_CHUNK`
-/// (16 MiB) inside the core's 32 MiB gRPC message envelope.
+/// Default and maximum size of one data message sent to the server. Uploads
+/// are framed into messages of this size; the server accepts messages up to
+/// 64 MiB.
 constexpr std::uint32_t kDefaultChunkSize = 1024 * 1024;
 constexpr std::uint32_t kMaxChunkSize = 16 * 1024 * 1024;
 /// Bound on best-effort `CloseObject` during `~ObjectDescriptor()` so a hung
-/// or stopped core cannot stall stack unwinding indefinitely.
+/// or stopped server cannot stall stack unwinding indefinitely.
 constexpr std::chrono::milliseconds kDescriptorCloseTimeout{500};
 
 constexpr std::uint32_t WriteChunkSize(std::uint32_t chunk_size_hint) {
   return chunk_size_hint == 0 ? kDefaultChunkSize
                               : std::min(chunk_size_hint, kMaxChunkSize);
+}
+
+/// `ReadChunk.data` is a vector of slices so the server can forward network
+/// buffers without concatenating them; join them into one Cord.
+absl::Cord JoinSlices(pb::ReadChunk const& chunk) {
+  absl::Cord out;
+  for (std::string const& slice : chunk.data()) out.Append(slice);
+  return out;
 }
 
 }  // namespace
@@ -56,28 +66,42 @@ grpc::ChannelArguments LocalChannelArguments(int channel_index) {
   args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
   args.SetInt("gcs_core.channel_index", channel_index);
   // For `unix:` targets gRPC uses the socket path as `:authority`, which the
-  // core's HTTP/2 stack (hyper/h2) rejects with RST_STREAM(PROTOCOL_ERROR);
-  // channels created from a descriptor default to `test.authority`. Any
-  // valid host name works, and the same one keeps both variants identical.
+  // server's HTTP/2 stack (hyper/h2) rejects with RST_STREAM(PROTOCOL_ERROR).
+  // Any valid host name works, and the same one keeps both variants
+  // identical.
   args.SetString(GRPC_ARG_DEFAULT_AUTHORITY, "localhost");
-  // The first connect usually races the sidecar creating its socket. gRPC's
+  // The first connect usually races the server creating its socket. gRPC's
   // default 1 s reconnect backoff would then dominate startup; a local socket
-  // needs only milliseconds between attempts. (A descriptor channel never
-  // reconnects; the arguments are harmless there.)
+  // needs only milliseconds between attempts.
   args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 5);
   args.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 5);
   args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 100);
   return args;
 }
 
-/// The stubs of one running core generation. Replaced as a whole on
+Status ValidateServerFlags(std::vector<std::string> const& args) {
+  for (std::string const& arg : args) {
+    for (std::string_view flag : {"--socket", "--pdeathsig", "--tcp"}) {
+      if (arg == flag || absl::StartsWith(arg, absl::StrCat(flag, "="))) {
+        return Status(StatusCode::kInvalidArgument,
+                      absl::StrCat(flag,
+                                   " is set by the wrapper or not "
+                                   "supported; remove it from "
+                                   "ClientOptions::sidecar_args"));
+      }
+    }
+  }
+  return {};
+}
+
+/// The stubs of one running server generation. Replaced as a whole on
 /// restart, so a call in flight keeps using the set it started with.
 struct StubSet {
   std::uint64_t generation = 0;
-  std::vector<std::unique_ptr<v0::StorageCore::Stub>> stubs;
+  std::vector<std::unique_ptr<pb::GcsCore::Stub>> stubs;
 };
 
-/// One running core (whatever the backend) plus the gRPC channels to it,
+/// One running server (whatever the backend) plus the gRPC channels to it,
 /// shared by `Client` instances whose backends have the same sharing key.
 class Connection {
  public:
@@ -121,7 +145,7 @@ class Connection {
         return Status(
             StatusCode::kFailedPrecondition,
             absl::StrCat("socket path ", (*backend)->SocketPath(),
-                         " is already in use by a sidecar with different "
+                         " is already in use by a server with different "
                          "ClientOptions"));
       }
     }
@@ -136,8 +160,8 @@ class Connection {
 
   ~Connection() {
     std::scoped_lock lk(mu_);
-    // Our channels first: an in-process core drains open connections before
-    // it stops, and no caller can hold a stub once the last Client is gone.
+    // Our channels first: the server drains open connections before it
+    // stops, and no caller can hold a stub once the last Client is gone.
     {
       std::scoped_lock slk(stubs_mu_);
       stubs_.reset();
@@ -147,14 +171,14 @@ class Connection {
 
   /// Round-robin over the channels. `stubs_mu_` only guards copying the
   /// `shared_ptr` and is never held across an RPC.
-  v0::StorageCore::Stub& Stub(std::shared_ptr<StubSet>& keepalive) {
+  pb::GcsCore::Stub& Stub(std::shared_ptr<StubSet>& keepalive) {
     keepalive = CurrentStubs();
     std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
     return *keepalive->stubs[i % keepalive->stubs.size()];
   }
 
-  /// Called after a failed RPC. If the core generation that served this RPC
-  /// died, start a new one once so the next call succeeds; concurrent
+  /// Called after a failed RPC. If the server generation that served this
+  /// RPC died, start a new one once so the next call succeeds; concurrent
   /// callers failing on the same generation observe the already-bumped
   /// `generation_` and do not restart a second time.
   Status Check(Status status, std::uint64_t failed_generation) {
@@ -163,7 +187,7 @@ class Connection {
     if (failed_generation != generation_) {
       return Status(
           StatusCode::kUnavailable,
-          absl::StrCat("core restarted after failure: ", status.message()));
+          absl::StrCat("server restarted after failure: ", status.message()));
     }
     if (backend_->Exited()) {
       std::string const why = backend_->ExitDescription();
@@ -181,15 +205,31 @@ class Connection {
 
   /// Dispatches one unary RPC on a round-robin channel and checks for crash
   /// restart on `UNAVAILABLE`.
+  /// `served_by`, if set, receives the generation that served the call.
   template <typename Request, typename Response>
-  Status Unary(grpc::Status (v0::StorageCore::Stub::*method)(
-                   grpc::ClientContext*, Request const&, Response*),
-               Request const& request, Response& response) {
+  Status Unary(grpc::Status (pb::GcsCore::Stub::*method)(grpc::ClientContext*,
+                                                         Request const&,
+                                                         Response*),
+               Request const& request, Response& response,
+               std::uint64_t* served_by = nullptr) {
     std::shared_ptr<StubSet> stubs;
     grpc::ClientContext ctx;
     Status s = FromGrpc((Stub(stubs).*method)(&ctx, request, &response));
+    if (served_by != nullptr) *served_by = stubs->generation;
     if (!s.ok()) return Check(std::move(s), stubs->generation);
     return {};
+  }
+
+  /// Like `Stub()`, but only while `generation` is still the running server.
+  /// Server-side handles are small counters that restart at 1, so a handle
+  /// from a server that has since been restarted would name an unrelated
+  /// object in the new one; callers holding such a handle get nullptr.
+  pb::GcsCore::Stub* StubFor(std::uint64_t generation,
+                             std::shared_ptr<StubSet>& keepalive) {
+    keepalive = CurrentStubs();
+    if (!keepalive || keepalive->generation != generation) return nullptr;
+    std::size_t const i = next_.fetch_add(1, std::memory_order_relaxed);
+    return keepalive->stubs[i % keepalive->stubs.size()].get();
   }
 
   int pid() const {
@@ -224,7 +264,7 @@ class Connection {
     auto set = std::make_shared<StubSet>();
     set->generation = ++generation_;
     for (std::shared_ptr<grpc::Channel>& channel : *channels) {
-      set->stubs.push_back(v0::StorageCore::NewStub(std::move(channel)));
+      set->stubs.push_back(pb::GcsCore::NewStub(std::move(channel)));
     }
     {
       std::scoped_lock slk(stubs_mu_);
@@ -247,14 +287,14 @@ class Connection {
       // Every channel must be connected, so the first measured call does not
       // pay connection setup.
       bool all_ready = true;
-      for (std::unique_ptr<v0::StorageCore::Stub> const& stub : set.stubs) {
+      for (std::unique_ptr<pb::GcsCore::Stub> const& stub : set.stubs) {
         grpc::ClientContext ctx;
         ctx.set_wait_for_ready(true);
         ctx.set_deadline(std::chrono::system_clock::now() +
                          std::chrono::milliseconds(200));
-        v0::GetVersionRequest request;
-        v0::GetVersionResponse response;
-        Status s = FromGrpc(stub->GetVersion(&ctx, request, &response));
+        pb::PingRequest request;
+        pb::PingResponse response;
+        Status s = FromGrpc(stub->Ping(&ctx, request, &response));
         if (!s.ok()) {
           last = std::move(s);
           all_ready = false;
@@ -298,32 +338,36 @@ bool ForEachChunk(absl::Cord const& data, std::size_t chunk, Fn&& fn) {
 
 class ReaderImpl {
  public:
-  explicit ReaderImpl(std::shared_ptr<Connection> conn)
-      : conn_(std::move(conn)) {}
+  ReaderImpl(std::shared_ptr<Connection> conn, std::string bucket,
+             std::string object)
+      : conn_(std::move(conn)),
+        bucket_(std::move(bucket)),
+        object_(std::move(object)) {}
   ~ReaderImpl() {
     if (reader_ && !done_) {
       context_.TryCancel();
-      v0::ReadObjectResponse discard;
+      pb::ReadChunk discard;
       while (reader_->Read(&discard)) {
       }
       (void)reader_->Finish();
     }
   }
 
-  Status Start(v0::ReadObjectRequest const& request) {
+  Status Start(pb::ReadObjectRequest const& request) {
     reader_ = conn_->Stub(stubs_).ReadObject(&context_, request);
-    v0::ReadObjectResponse first;
+    pb::ReadChunk first;
     if (!reader_->Read(&first)) {
       done_ = true;
       Status s = FromGrpc(reader_->Finish());
       if (s.ok()) {
         return Status(StatusCode::kInternal,
-                      "core closed ReadObject without metadata");
+                      "server closed ReadObject without metadata");
       }
       return conn_->Check(std::move(s), stubs_->generation);
     }
-    metadata_ = FromProto(first.metadata());
-    if (!first.data().empty()) pending_ = absl::Cord(first.data());
+    metadata_ = FromProto(first.meta(), bucket_, object_);
+    absl::Cord data = JoinSlices(first);
+    if (!data.empty()) pending_ = std::move(data);
     return {};
   }
 
@@ -336,11 +380,10 @@ class ReaderImpl {
       return out;
     }
     if (done_) return std::optional<absl::Cord>{};
-    v0::ReadObjectResponse message;
+    pb::ReadChunk message;
     while (reader_->Read(&message)) {
-      if (!message.data().empty()) {
-        return std::optional<absl::Cord>(absl::Cord(message.data()));
-      }
+      absl::Cord data = JoinSlices(message);
+      if (!data.empty()) return std::optional<absl::Cord>(std::move(data));
     }
     done_ = true;
     Status s = FromGrpc(reader_->Finish());
@@ -350,44 +393,49 @@ class ReaderImpl {
 
  private:
   std::shared_ptr<Connection> conn_;
+  std::string bucket_;
+  std::string object_;
   std::shared_ptr<StubSet> stubs_;
   grpc::ClientContext context_;
-  std::unique_ptr<grpc::ClientReader<v0::ReadObjectResponse>> reader_;
+  std::unique_ptr<grpc::ClientReader<pb::ReadChunk>> reader_;
   ObjectMetadata metadata_;
   std::optional<absl::Cord> pending_;
   bool done_ = false;
 };
 
-/// Shared shape of the two client-streaming uploads.
-template <typename Request, typename Response>
-class UploadStream {
+/// One client-streaming `WriteObject`: a header message, then data messages.
+/// Used for regular and appendable uploads; the header's transport selects
+/// which one the server performs.
+class WriterImpl {
  public:
-  using StartFn = std::unique_ptr<grpc::ClientWriter<Request>> (
-      v0::StorageCore::Stub::*)(grpc::ClientContext*, Response*);
-
-  UploadStream(std::shared_ptr<Connection> conn, v0::WriteSpec spec,
-               std::uint32_t chunk_size_hint, StartFn start)
+  WriterImpl(std::shared_ptr<Connection> conn, pb::WriteHeader header,
+             std::uint32_t chunk_size_hint)
       : conn_(std::move(conn)),
-        spec_(std::move(spec)),
+        header_(std::move(header)),
         write_chunk_size_(WriteChunkSize(chunk_size_hint)) {
-    writer_ = (conn_->Stub(stubs_).*start)(&context_, &response_);
+    writer_ = conn_->Stub(stubs_).WriteObject(&context_, &response_);
   }
-  ~UploadStream() {
+  ~WriterImpl() {
+    // Cancelling makes the server fail the upload instead of finalizing a
+    // partial object.
     if (writer_ && !finished_) {
       context_.TryCancel();
       (void)writer_->Finish();
     }
   }
 
+  std::string const& bucket() const { return header_.bucket(); }
+  std::string const& object() const { return header_.object(); }
+
   Status Write(absl::Cord const& data) {
     if (finished_) {
       return Status(StatusCode::kFailedPrecondition, "upload already closed");
     }
     bool const ok =
+        SendHeader() &&
         ForEachChunk(data, write_chunk_size_, [&](absl::Cord const& chunk) {
-          Request request;
-          AttachSpec(request);
-          request.set_data(chunk);
+          pb::WriteRequest request;
+          request.set_data(std::string(chunk));
           return writer_->Write(request);
         });
     // A failed Write means the stream is broken; Finish reports why.
@@ -395,22 +443,11 @@ class UploadStream {
     return {};
   }
 
-  StatusOr<Response> Finish() { return FinishImpl(Request{}, false); }
-
-  /// Sends `last` as the final message (carrying flags such as `finalize`).
-  StatusOr<Response> FinishWithLast(Request last) {
-    return FinishImpl(std::move(last), true);
-  }
-
- private:
-  StatusOr<Response> FinishImpl(Request last, bool send_last) {
+  StatusOr<pb::WriteObjectResponse> Finish() {
     if (finished_) {
       return Status(StatusCode::kFailedPrecondition, "upload already closed");
     }
-    if (send_last || !spec_sent_) {
-      AttachSpec(last);
-      (void)writer_->Write(last);
-    }
+    (void)SendHeader();
     (void)writer_->WritesDone();
     finished_ = true;
     Status s = FromGrpc(writer_->Finish());
@@ -418,44 +455,43 @@ class UploadStream {
     return response_;
   }
 
-  void AttachSpec(Request& request) {
-    if (spec_sent_) return;
-    *request.mutable_spec() = spec_;
-    spec_sent_ = true;
+ private:
+  bool SendHeader() {
+    if (header_sent_) return true;
+    header_sent_ = true;
+    pb::WriteRequest request;
+    *request.mutable_header() = header_;
+    return writer_->Write(request);
   }
 
   std::shared_ptr<Connection> conn_;
   std::shared_ptr<StubSet> stubs_;
-  v0::WriteSpec spec_;
+  pb::WriteHeader header_;
   std::size_t write_chunk_size_;
   grpc::ClientContext context_;
-  Response response_;
-  std::unique_ptr<grpc::ClientWriter<Request>> writer_;
-  bool spec_sent_ = false;
+  pb::WriteObjectResponse response_;
+  std::unique_ptr<grpc::ClientWriter<pb::WriteRequest>> writer_;
+  bool header_sent_ = false;
   bool finished_ = false;
 };
 
-class WriterImpl
-    : public UploadStream<v0::WriteObjectRequest, v0::WriteObjectResponse> {
- public:
-  WriterImpl(std::shared_ptr<Connection> conn, v0::WriteSpec spec,
-             std::uint32_t chunk_size_hint)
-      : UploadStream(std::move(conn), std::move(spec), chunk_size_hint,
-                     &v0::StorageCore::Stub::WriteObject) {}
-};
-
-class AppendableWriterImpl : public UploadStream<v0::AppendableWriteRequest,
-                                                 v0::AppendableWriteResponse> {
- public:
-  AppendableWriterImpl(std::shared_ptr<Connection> conn, v0::WriteSpec spec,
-                       std::uint32_t chunk_size_hint)
-      : UploadStream(std::move(conn), std::move(spec), chunk_size_hint,
-                     &v0::StorageCore::Stub::AppendableWrite) {}
-};
+namespace {
+ObjectMetadata FromWriteResponse(pb::WriteObjectResponse const& r,
+                                 std::string const& bucket,
+                                 std::string const& object) {
+  ObjectMetadata out;
+  out.bucket = bucket;
+  out.name = object;
+  out.generation = r.generation();
+  out.size = static_cast<std::uint64_t>(r.size());
+  if (r.crc32c() != 0) out.crc32c = r.crc32c();
+  return out;
+}
+}  // namespace
 
 }  // namespace internal
 
-namespace v0 = ::gcs::core::v0;
+namespace pb = ::gcscore::v1;
 using ::google::cloud::StatusCode;
 using internal::FromGrpc;
 using internal::FromProto;
@@ -485,15 +521,15 @@ Status ObjectWriter::Write(absl::Cord const& data) {
   return impl_->Write(data);
 }
 StatusOr<ObjectMetadata> ObjectWriter::Close() {
-  StatusOr<v0::WriteObjectResponse> response = impl_->Finish();
+  StatusOr<pb::WriteObjectResponse> response = impl_->Finish();
   if (!response) return std::move(response).status();
-  return FromProto(response->metadata());
+  return internal::FromWriteResponse(*response, impl_->bucket(),
+                                     impl_->object());
 }
 
 // --- AppendableWriter
 // -----------------------------------------------------------
-AppendableWriter::AppendableWriter(
-    std::unique_ptr<internal::AppendableWriterImpl> impl)
+AppendableWriter::AppendableWriter(std::unique_ptr<internal::WriterImpl> impl)
     : impl_(std::move(impl)) {}
 AppendableWriter::AppendableWriter(AppendableWriter&&) noexcept = default;
 AppendableWriter& AppendableWriter::operator=(AppendableWriter&&) noexcept =
@@ -503,37 +539,49 @@ Status AppendableWriter::Write(absl::Cord const& data) {
   return impl_->Write(data);
 }
 StatusOr<ObjectMetadata> AppendableWriter::Finalize() {
-  v0::AppendableWriteRequest last;
-  last.set_finalize(true);
-  StatusOr<v0::AppendableWriteResponse> response =
-      impl_->FinishWithLast(std::move(last));
+  StatusOr<pb::WriteObjectResponse> response = impl_->Finish();
   if (!response) return std::move(response).status();
-  return FromProto(response->metadata());
+  // A JSON fallback means the caller measured or relied on something other
+  // than an appendable BidiWriteObject upload; never report it as success.
+  if (response->transport_used() != pb::GRPC) {
+    return Status(StatusCode::kFailedPrecondition,
+                  absl::StrCat("server wrote gs://", impl_->bucket(), "/",
+                               impl_->object(),
+                               " as a regular object over JSON instead of an "
+                               "appendable BidiWriteObject upload"));
+  }
+  return internal::FromWriteResponse(*response, impl_->bucket(),
+                                     impl_->object());
 }
+// NOLINTNEXTLINE(readability-convert-member-functions-to-static): public API
 StatusOr<std::int64_t> AppendableWriter::Close() {
-  StatusOr<v0::AppendableWriteResponse> response = impl_->Finish();
-  if (!response) return std::move(response).status();
-  return response->persisted_size();
+  return Status(StatusCode::kUnimplemented,
+                "the shared server finalizes appendable uploads when the "
+                "stream ends; leaving an object appendable is not supported");
 }
 
 // --- ObjectDescriptor
 // -----------------------------------------------------------
 ObjectDescriptor::ObjectDescriptor(std::shared_ptr<internal::Connection> conn,
+                                   std::uint64_t generation,
                                    std::uint64_t handle,
                                    ObjectMetadata metadata,
                                    std::uint32_t chunk_size_hint)
     : conn_(std::move(conn)),
+      generation_(generation),
       handle_(handle),
       metadata_(std::move(metadata)),
       chunk_size_hint_(chunk_size_hint) {}
 ObjectDescriptor::ObjectDescriptor(ObjectDescriptor&& rhs) noexcept
     : conn_(std::move(rhs.conn_)),
+      generation_(rhs.generation_),
       handle_(rhs.handle_),
       metadata_(std::move(rhs.metadata_)),
       chunk_size_hint_(rhs.chunk_size_hint_) {}
 ObjectDescriptor& ObjectDescriptor::operator=(ObjectDescriptor&& rhs) noexcept {
   ObjectDescriptor tmp(std::move(rhs));
   std::swap(conn_, tmp.conn_);
+  std::swap(generation_, tmp.generation_);
   std::swap(handle_, tmp.handle_);
   std::swap(metadata_, tmp.metadata_);
   std::swap(chunk_size_hint_, tmp.chunk_size_hint_);
@@ -542,36 +590,110 @@ ObjectDescriptor& ObjectDescriptor::operator=(ObjectDescriptor&& rhs) noexcept {
 ObjectDescriptor::~ObjectDescriptor() {
   if (!conn_) return;
   std::shared_ptr<internal::StubSet> stubs;
+  pb::GcsCore::Stub* stub = conn_->StubFor(generation_, stubs);
+  // The server that issued the handle is gone and took the handle with it.
+  if (stub == nullptr) return;
   grpc::ClientContext ctx;
   ctx.set_deadline(std::chrono::system_clock::now() +
                    internal::kDescriptorCloseTimeout);
-  v0::CloseObjectRequest request;
+  pb::CloseObjectRequest request;
   request.set_handle(handle_);
-  v0::CloseObjectResponse response;
-  (void)conn_->Stub(stubs).CloseObject(&ctx, request, &response);
+  pb::Empty response;
+  (void)stub->CloseObject(&ctx, request, &response);
 }
 ObjectMetadata const& ObjectDescriptor::metadata() const { return metadata_; }
+
+namespace {
+
+/// One in-flight `ReadRange` RPC of `ObjectDescriptor::ReadRanges`.
+struct RangeCall {
+  grpc::ClientContext context;
+  pb::ReadChunk message;
+  grpc::Status status;
+  std::unique_ptr<grpc::ClientAsyncReader<pb::ReadChunk>> reader;
+};
+
+enum class RangeEvent : std::uintptr_t { kStarted = 0, kRead = 1, kDone = 2 };
+constexpr std::uintptr_t kRangeEventBits = 2;
+
+void* RangeTag(std::size_t index, RangeEvent event) {
+  // gRPC completion-queue tags are opaque pointers; packing the range index
+  // and event into one avoids allocating a tag per event.
+  // NOLINTNEXTLINE(performance-no-int-to-ptr)
+  return reinterpret_cast<void*>((index << kRangeEventBits) |
+                                 static_cast<std::uintptr_t>(event));
+}
+
+}  // namespace
 
 Status ObjectDescriptor::ReadRanges(
     std::vector<ReadRange> const& ranges,
     std::function<void(std::size_t, absl::Cord const&)> const& on_data) {
-  v0::ReadRangesRequest request;
-  request.set_handle(handle_);
-  request.set_chunk_size_hint(chunk_size_hint_);
-  for (ReadRange const& r : ranges) {
-    v0::ReadRange& p = *request.add_ranges();
-    p.set_offset(r.offset);
-    p.set_limit(r.limit);
-  }
+  if (ranges.empty()) return {};
   std::shared_ptr<internal::StubSet> stubs;
-  grpc::ClientContext ctx;
-  std::unique_ptr<grpc::ClientReader<v0::ReadRangesResponse>> reader =
-      conn_->Stub(stubs).ReadRanges(&ctx, request);
-  v0::ReadRangesResponse message;
-  while (reader->Read(&message)) {
-    on_data(message.range_index(), absl::Cord(message.data()));
+  pb::GcsCore::Stub* stub = conn_->StubFor(generation_, stubs);
+  if (stub == nullptr) {
+    return Status(StatusCode::kFailedPrecondition,
+                  "the server that opened this descriptor has restarted; "
+                  "open the object again");
   }
-  return conn_->Check(FromGrpc(reader->Finish()), stubs->generation);
+  // One completion queue drives all ranges from the calling thread, so
+  // `on_data` runs here without a thread per range.
+  grpc::CompletionQueue cq;
+  std::vector<std::unique_ptr<RangeCall>> calls;
+  calls.reserve(ranges.size());
+  for (std::size_t i = 0; i != ranges.size(); ++i) {
+    auto call = std::make_unique<RangeCall>();
+    auto const [offset, length] = internal::ToOffsetLength(ranges[i]);
+    pb::ReadRangeRequest request;
+    request.set_handle(handle_);
+    request.set_offset(offset);
+    request.set_length(length);
+    request.set_chunk_size(chunk_size_hint_);
+    call->reader = stub->PrepareAsyncReadRange(&call->context, request, &cq);
+    call->reader->StartCall(RangeTag(i, RangeEvent::kStarted));
+    calls.push_back(std::move(call));
+  }
+
+  Status first_error;
+  std::size_t remaining = calls.size();
+  void* tag = nullptr;
+  bool ok = false;
+  while (remaining != 0 && cq.Next(&tag, &ok)) {
+    auto const bits = reinterpret_cast<std::uintptr_t>(tag);
+    std::size_t const index = bits >> kRangeEventBits;
+    auto const event =
+        static_cast<RangeEvent>(bits & ((1U << kRangeEventBits) - 1));
+    RangeCall& call = *calls[index];
+    switch (event) {
+      case RangeEvent::kStarted:
+      case RangeEvent::kRead:
+        if (event == RangeEvent::kRead && ok) {
+          on_data(index, internal::JoinSlices(call.message));
+        }
+        if (ok) {
+          call.reader->Read(&call.message, RangeTag(index, RangeEvent::kRead));
+        } else {
+          call.reader->Finish(&call.status, RangeTag(index, RangeEvent::kDone));
+        }
+        break;
+      case RangeEvent::kDone:
+        --remaining;
+        if (!call.status.ok() && first_error.ok()) {
+          first_error = FromGrpc(call.status);
+          // The result is an error either way; stop the other ranges early.
+          for (std::unique_ptr<RangeCall> const& c : calls) {
+            c->context.TryCancel();
+          }
+        }
+        break;
+    }
+  }
+  cq.Shutdown();
+  while (cq.Next(&tag, &ok)) {
+  }
+  if (first_error.ok()) return {};
+  return conn_->Check(std::move(first_error), generation_);
 }
 
 // --- Client
@@ -591,14 +713,16 @@ StatusOr<ObjectReader> Client::ReadObject(std::string const& bucket,
                                           std::string const& object,
                                           ReadRange range,
                                           std::int64_t generation) {
-  v0::ReadObjectRequest request;
+  auto const [offset, length] = internal::ToOffsetLength(range);
+  pb::ReadObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
+  request.set_offset(offset);
+  request.set_length(length);
   request.set_generation(generation);
-  request.mutable_range()->set_offset(range.offset);
-  request.mutable_range()->set_limit(range.limit);
-  request.set_chunk_size_hint(chunk_size_hint_);
-  auto impl = std::make_unique<internal::ReaderImpl>(conn_);
+  request.set_transport(pb::JSON);
+  request.set_chunk_size(chunk_size_hint_);
+  auto impl = std::make_unique<internal::ReaderImpl>(conn_, bucket, object);
   if (Status s = impl->Start(request); !s.ok()) return s;
   return ObjectReader(std::move(impl));
 }
@@ -610,10 +734,9 @@ StatusOr<ObjectWriter> Client::WriteObject(std::string const& bucket,
     return Status(StatusCode::kInvalidArgument,
                   "UploadMode::kSingleShot requires size_hint");
   }
-  v0::WriteSpec spec;
-  internal::ToProto(options, bucket, object, spec);
   return ObjectWriter(std::make_unique<internal::WriterImpl>(
-      conn_, std::move(spec), chunk_size_hint_));
+      conn_, internal::ToWriteHeader(options, bucket, object, pb::JSON),
+      chunk_size_hint_));
 }
 
 StatusOr<ObjectMetadata> Client::InsertObject(std::string const& bucket,
@@ -629,24 +752,47 @@ StatusOr<ObjectMetadata> Client::InsertObject(std::string const& bucket,
 
 StatusOr<ListObjectsPage> Client::ListObjects(
     std::string const& bucket, ListObjectsRequest const& request) {
-  v0::ListObjectsRequest proto;
+  pb::ListObjectsRequest proto;
   proto.set_bucket(bucket);
   proto.set_prefix(request.prefix);
   proto.set_delimiter(request.delimiter);
+  proto.set_start_offset(request.start_offset);
+  proto.set_end_offset(request.end_offset);
+  proto.set_versions(request.versions);
   proto.set_page_size(request.page_size);
   proto.set_page_token(request.page_token);
-  v0::ListObjectsResponse response;
-  if (Status s =
-          conn_->Unary(&v0::StorageCore::Stub::ListObjects, proto, response);
+  pb::ListObjectsResponse response;
+  if (Status s = conn_->Unary(&pb::GcsCore::Stub::ListObjects, proto, response);
       !s.ok()) {
     return s;
   }
   ListObjectsPage page;
-  page.objects.reserve(response.objects_size());
-  for (v0::ObjectMetadata const& o : response.objects()) {
-    page.objects.push_back(FromProto(o));
+  page.objects.reserve(response.items_size());
+  for (pb::ListedObject const& o : response.items()) {
+    page.objects.push_back(FromProto(o, bucket));
   }
   page.prefixes.assign(response.prefixes().begin(), response.prefixes().end());
+  page.next_page_token = response.next_page_token();
+  return page;
+}
+
+StatusOr<ListBucketsPage> Client::ListBuckets(
+    std::string const& project, ListBucketsRequest const& request) {
+  pb::ListBucketsRequest proto;
+  proto.set_project(project);
+  proto.set_prefix(request.prefix);
+  proto.set_page_size(request.page_size);
+  proto.set_page_token(request.page_token);
+  pb::ListBucketsResponse response;
+  if (Status s = conn_->Unary(&pb::GcsCore::Stub::ListBuckets, proto, response);
+      !s.ok()) {
+    return s;
+  }
+  ListBucketsPage page;
+  page.buckets.reserve(response.items_size());
+  for (pb::ListedBucket const& b : response.items()) {
+    page.buckets.push_back(FromProto(b));
+  }
   page.next_page_token = response.next_page_token();
   return page;
 }
@@ -654,29 +800,31 @@ StatusOr<ListObjectsPage> Client::ListObjects(
 Status Client::DeleteObject(std::string const& bucket,
                             std::string const& object,
                             std::int64_t generation) {
-  v0::DeleteObjectRequest request;
+  pb::DeleteObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
   request.set_generation(generation);
-  v0::DeleteObjectResponse response;
-  return conn_->Unary(&v0::StorageCore::Stub::DeleteObject, request, response);
+  pb::Empty response;
+  return conn_->Unary(&pb::GcsCore::Stub::DeleteObject, request, response);
 }
 
 StatusOr<ObjectDescriptor> Client::OpenObject(std::string const& bucket,
                                               std::string const& object,
                                               std::int64_t generation) {
-  v0::OpenObjectRequest request;
+  pb::OpenObjectRequest request;
   request.set_bucket(bucket);
   request.set_object(object);
   request.set_generation(generation);
-  v0::OpenObjectResponse response;
-  if (Status s =
-          conn_->Unary(&v0::StorageCore::Stub::OpenObject, request, response);
+  pb::OpenObjectResponse response;
+  std::uint64_t served_by = 0;
+  if (Status s = conn_->Unary(&pb::GcsCore::Stub::OpenObject, request, response,
+                              &served_by);
       !s.ok()) {
     return s;
   }
-  return ObjectDescriptor(conn_, response.handle(),
-                          FromProto(response.metadata()), chunk_size_hint_);
+  return ObjectDescriptor(conn_, served_by, response.handle(),
+                          FromProto(response.meta(), bucket, object),
+                          chunk_size_hint_);
 }
 
 StatusOr<AppendableWriter> Client::StartAppendableUpload(
@@ -690,44 +838,44 @@ StatusOr<AppendableWriter> Client::StartAppendableUpload(
     return Status(StatusCode::kInvalidArgument,
                   "StartAppendableUpload does not support size_hint");
   }
-  v0::WriteSpec spec;
-  internal::ToProto(options, bucket, object, spec);
-  return AppendableWriter(std::make_unique<internal::AppendableWriterImpl>(
-      conn_, std::move(spec), chunk_size_hint_));
+  return AppendableWriter(std::make_unique<internal::WriterImpl>(
+      conn_, internal::ToWriteHeader(options, bucket, object, pb::GRPC),
+      chunk_size_hint_));
 }
 
-StatusOr<SidecarVersion> Client::GetSidecarVersion() {
-  v0::GetVersionRequest request;
-  v0::GetVersionResponse response;
-  if (Status s =
-          conn_->Unary(&v0::StorageCore::Stub::GetVersion, request, response);
+namespace {
+StatusOr<pb::StatsResponse> Stats(internal::Connection& conn) {
+  pb::StatsRequest request;
+  pb::StatsResponse response;
+  if (Status s = conn.Unary(&pb::GcsCore::Stub::Stats, request, response);
       !s.ok()) {
     return s;
   }
+  return response;
+}
+
+std::uint64_t SecondsToMicros(double seconds) {
+  return static_cast<std::uint64_t>(seconds * 1e6);
+}
+}  // namespace
+
+StatusOr<SidecarVersion> Client::GetSidecarVersion() {
+  StatusOr<pb::StatsResponse> stats = Stats(*conn_);
+  if (!stats) return std::move(stats).status();
   SidecarVersion v;
-  v.sidecar_version = response.sidecar_version();
-  v.storage_crate_version = response.storage_crate_version();
-  v.pid = response.pid();
-  v.bidi_enabled = response.bidi_enabled();
-  v.synthetic = response.synthetic();
+  v.pid = static_cast<std::uint32_t>(stats->pid());
   return v;
 }
 
 StatusOr<SidecarStats> Client::GetSidecarStats() {
-  v0::GetStatsRequest request;
-  v0::GetStatsResponse response;
-  if (Status s =
-          conn_->Unary(&v0::StorageCore::Stub::GetStats, request, response);
-      !s.ok()) {
-    return s;
-  }
+  StatusOr<pb::StatsResponse> stats = Stats(*conn_);
+  if (!stats) return std::move(stats).status();
   SidecarStats out;
-  out.user_cpu_us = response.user_cpu_us();
-  out.system_cpu_us = response.system_cpu_us();
-  out.rss_bytes = response.rss_bytes();
-  out.peak_rss_bytes = response.peak_rss_bytes();
-  out.allocated_bytes = response.allocated_bytes();
-  out.threads = response.threads();
+  out.user_cpu_us = SecondsToMicros(stats->cpu_user_secs());
+  out.system_cpu_us = SecondsToMicros(stats->cpu_sys_secs());
+  out.rss_bytes = static_cast<std::uint64_t>(stats->rss_bytes());
+  out.peak_rss_bytes = static_cast<std::uint64_t>(stats->peak_rss_bytes());
+  out.threads = static_cast<std::uint32_t>(stats->threads());
   return out;
 }
 

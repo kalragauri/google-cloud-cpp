@@ -26,14 +26,15 @@
 
 namespace gcs_core::internal {
 
-/// Name of the sidecar binary looked up next to the executable and on PATH.
-inline constexpr std::string_view kSidecarBinaryName = "gcs-core-sidecar";
-/// Environment variable that overrides sidecar discovery.
-inline constexpr std::string_view kSidecarEnvVar = "GCS_CORE_SIDECAR";
+/// Name of the shared server binary (`storage-grpc-uds` in google-cloud-rust)
+/// looked up next to the executable and on PATH.
+inline constexpr std::string_view kSidecarBinaryName = "gcs-core-server";
+/// Environment variable that overrides server discovery.
+inline constexpr std::string_view kSidecarEnvVar = "GCS_CORE_SERVER";
 /// `sizeof(sockaddr_un::sun_path)` minus the terminating NUL.
 inline constexpr std::size_t kMaxSocketPathLength = 107;
 
-/// Resolves the sidecar binary: `configured`, else `$GCS_CORE_SIDECAR`, else
+/// Resolves the server binary: `configured`, else `$GCS_CORE_SERVER`, else
 /// next to the running executable, else `PATH`. An explicitly configured or
 /// env-provided path that is not executable is an error (no fallback), so a
 /// typo never silently runs a different binary.
@@ -46,11 +47,14 @@ google::cloud::StatusOr<std::string> DefaultSocketPath();
 /// Rejects empty paths, paths longer than `sun_path`, and existing non-sockets.
 google::cloud::Status ValidateSocketPath(std::string const& path);
 
-/// Owns one sidecar child process.
+/// Owns one `gcs-core-server` child process in its 1:1 child mode
+/// (`--pdeathsig=true --idle-secs=0`).
 ///
-/// The child inherits the read end of a pipe as `--parent-fd=3`; the write
-/// end stays in this process (close-on-exec). When this process exits for
-/// any reason the kernel closes it, the sidecar reads EOF and shuts down.
+/// The server asks the kernel for SIGTERM when its parent goes away
+/// (`PR_SET_PDEATHSIG`). Linux ties that to the *thread* that spawned the
+/// child, not the process, so `Spawn()` runs `posix_spawn` on a helper thread
+/// that lives as long as this process; spawning from a short-lived caller
+/// thread would kill the server when that thread ends.
 class SidecarProcess {
  public:
   static google::cloud::StatusOr<std::unique_ptr<SidecarProcess>> Spawn(
@@ -70,17 +74,20 @@ class SidecarProcess {
   /// Exit description once `Exited()` returned true.
   std::string ExitDescription() const;
 
-  /// Closes the lifetime pipe, waits up to 2 s (or `grace`), then SIGTERM,
-  /// then SIGKILL; removes the socket file. Idempotent.
+  /// SIGTERM (the server drains and exits), waits up to 2 s (or `grace`),
+  /// then SIGKILL; removes leftover socket files. Idempotent.
   void Terminate();
   void Terminate(std::chrono::milliseconds grace);
+  /// SIGKILL without a grace period, as a crash would; removes leftover
+  /// socket files. Idempotent.
+  void Kill();
 
  private:
-  SidecarProcess(pid_t pid, int lifetime_fd, std::string socket_path);
+  SidecarProcess(pid_t pid, std::string socket_path);
   bool WaitFor(std::chrono::milliseconds timeout);
+  void RemoveSocketFiles() const;
 
   pid_t pid_;
-  int lifetime_fd_;
   std::string socket_path_;
   std::optional<int> wait_status_;
   bool reaped_externally_ = false;

@@ -13,13 +13,12 @@
 // limitations under the License.
 
 // Tests of the in-process (thread-boundary) variant only: option validation,
-// core sharing and teardown by thread count, link modes, process-wide stats,
-// thread hooks and CPU attribution. Everything that holds for both variants
+// core sharing and teardown by thread count, process-wide stats and CPU
+// attribution. Everything that holds for both variants
 // is in client_common_test.cc.
 
 #include "absl/strings/match.h"
 #include "gcs_core/client.h"
-#include "gcs_core/inproc.h"
 #include "test_support.h"
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
@@ -40,12 +39,11 @@
 namespace gcs_core {
 namespace {
 
-using ::gcs_core::testing::CrashCore;
 using ::gcs_core::testing::IsOk;
-using ::gcs_core::testing::ReadSize;
+using ::gcs_core::testing::ServerOptions;
 using ::gcs_core::testing::StatusIs;
-using ::gcs_core::testing::SyntheticOptions;
 using ::google::cloud::StatusCode;
+using ::testing::AllOf;
 using ::testing::HasSubstr;
 
 /// Threads of this process whose name starts with `gcs-core-`, the prefix the
@@ -87,7 +85,7 @@ std::int64_t StatusField(char const* key) {
 /// @test The sidecar binary option has no meaning in-process and is rejected
 /// rather than silently ignored.
 TEST(InprocClientTest, RejectsSidecarPath) {
-  ClientOptions options = SyntheticOptions();
+  ClientOptions options = ServerOptions();
   options.sidecar_path = "/bin/true";
   StatusOr<Client> client = Client::Create(options);
   EXPECT_THAT(client, StatusIs(StatusCode::kInvalidArgument));
@@ -96,76 +94,44 @@ TEST(InprocClientTest, RejectsSidecarPath) {
 
 /// @test The socket path option has no meaning in-process and is rejected.
 TEST(InprocClientTest, RejectsSocketPath) {
-  ClientOptions options = SyntheticOptions();
+  ClientOptions options = ServerOptions();
   options.socket_path = "/tmp/gcs-core-unused.sock";
   StatusOr<Client> client = Client::Create(options);
   EXPECT_THAT(client, StatusIs(StatusCode::kInvalidArgument));
   EXPECT_THAT(client.status().message(), HasSubstr("socket_path"));
 }
 
-/// @test Sidecar discovery is not consulted: a bogus `GCS_CORE_SIDECAR` does
+/// @test Server discovery is not consulted: a bogus `GCS_CORE_SERVER` does
 /// not stop an in-process core from starting.
 TEST(InprocClientTest, IgnoresSidecarDiscovery) {
-  ::setenv("GCS_CORE_SIDECAR", "/nonexistent/gcs-core-sidecar", 1);
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
-  ::unsetenv("GCS_CORE_SIDECAR");
+  ::setenv("GCS_CORE_SERVER", "/nonexistent/gcs-core-server", 1);
+  StatusOr<Client> client = Client::Create(ServerOptions());
+  ::unsetenv("GCS_CORE_SERVER");
   ASSERT_THAT(client, IsOk());
   EXPECT_THAT(client->GetSidecarVersion(), IsOk());
 }
 
-class CoreArgTest : public ::testing::TestWithParam<char const*> {};
-
-/// @test The core flags the sidecar accepts are accepted in-process with the
-/// same meaning (`--chunk-size` is observable; the others must not be
-/// rejected).
-TEST_P(CoreArgTest, Accepted) {
-  ClientOptions options = SyntheticOptions();
-  options.sidecar_args.emplace_back(GetParam());
-  StatusOr<Client> client = Client::Create(options);
-  ASSERT_THAT(client, IsOk());
-  StatusOr<ObjectReader> reader = client->ReadObject("b", "sized/65536");
-  ASSERT_THAT(reader, IsOk());
-  std::size_t max_chunk = 0;
-  ASSERT_THAT(ReadSize(*reader, &max_chunk), IsOk());
-  if (std::string(GetParam()) == "--chunk-size=4096") {
-    EXPECT_EQ(max_chunk, 4096U);
-  } else {
-    EXPECT_EQ(max_chunk, 65536U);
-  }
-}
-
-INSTANTIATE_TEST_SUITE_P(
-    Flags, CoreArgTest,
-    ::testing::Values("--chunk-size=4096", "--no-coalesce-reads",
-                      "--worker-threads=1", "--grpc-subchannels=4",
-                      "--stream-window=65535", "--connection-window=131072",
-                      "--link=socketpair"));
-
-/// @test Flags that describe a separate process, and unknown flags, fail
-/// Create() with INVALID_ARGUMENT naming the flag, before any thread starts.
-TEST(InprocClientTest, RejectsProcessOnlyAndUnknownArgs) {
-  int const before = CoreThreads();
-  for (char const* flag : {"--socket=/tmp/gcs-core-x.sock", "--parent-fd=5",
-                           "--no-such-flag", "--link=tcp", "--chunk-size=0"}) {
-    ClientOptions options = SyntheticOptions();
-    options.sidecar_args.emplace_back(flag);
-    StatusOr<Client> client = Client::Create(options);
-    EXPECT_THAT(client, StatusIs(StatusCode::kInvalidArgument)) << flag;
-    std::string const name =
-        std::string(flag).substr(0, std::string(flag).find('='));
-    EXPECT_THAT(client.status().message(), HasSubstr(name));
-  }
-  EXPECT_EQ(CoreThreads(), before);
+/// @test A rejected flag (reserved or unknown) fails Create() before any
+/// core thread starts, so a bad configuration leaves nothing running.
+TEST(InprocClientTest, RejectedFlagsStartNoThreads) {
+  WaitForCoreThreads(0);
+  ClientOptions reserved = ServerOptions();
+  reserved.sidecar_args.emplace_back("--tcp=127.0.0.1:0");
+  EXPECT_THAT(Client::Create(reserved), StatusIs(StatusCode::kInvalidArgument));
+  ClientOptions unknown = ServerOptions();
+  unknown.sidecar_args.emplace_back("--no-such-flag");
+  EXPECT_THAT(Client::Create(unknown), StatusIs(StatusCode::kInvalidArgument));
+  EXPECT_EQ(CoreThreads(), 0);
 }
 
 /// @test Clients with equal options share one core: the second Create()
 /// starts no threads.
 TEST(InprocClientTest, SharedCoreAcrossEqualOptions) {
-  StatusOr<Client> a = Client::Create(SyntheticOptions());
+  StatusOr<Client> a = Client::Create(ServerOptions());
   ASSERT_THAT(a, IsOk());
   int const with_one = CoreThreads();
   EXPECT_GT(with_one, 0);
-  StatusOr<Client> b = Client::Create(SyntheticOptions());
+  StatusOr<Client> b = Client::Create(ServerOptions());
   ASSERT_THAT(b, IsOk());
   EXPECT_EQ(CoreThreads(), with_one);
   EXPECT_THAT(b->GetSidecarVersion(), IsOk());
@@ -174,26 +140,22 @@ TEST(InprocClientTest, SharedCoreAcrossEqualOptions) {
 /// @test Different core options start a second core (own threads) rather
 /// than silently reusing the first one's configuration.
 TEST(InprocClientTest, DifferentOptionsUseSeparateCores) {
-  StatusOr<Client> a = Client::Create(SyntheticOptions());
+  StatusOr<Client> a = Client::Create(ServerOptions());
   ASSERT_THAT(a, IsOk());
   int const with_one = CoreThreads();
-  ClientOptions small = SyntheticOptions();
+  ClientOptions small = ServerOptions();
   small.sidecar_args.emplace_back("--chunk-size=4096");
   StatusOr<Client> b = Client::Create(small);
   ASSERT_THAT(b, IsOk());
   EXPECT_GT(CoreThreads(), with_one);
-  StatusOr<ObjectReader> rb = b->ReadObject("b", "sized/65536");
-  ASSERT_THAT(rb, IsOk());
-  std::size_t max_b = 0;
-  ASSERT_THAT(ReadSize(*rb, &max_b), IsOk());
-  EXPECT_EQ(max_b, 4096U);
+  EXPECT_THAT(b->GetSidecarVersion(), IsOk());
 }
 
 /// @test Concurrent Create() calls with equal options end up on one core.
 TEST(InprocClientTest, ConcurrentCreateSharesRuntime) {
   int single = 0;
   {
-    StatusOr<Client> one = Client::Create(SyntheticOptions());
+    StatusOr<Client> one = Client::Create(ServerOptions());
     ASSERT_THAT(one, IsOk());
     single = CoreThreads();
   }
@@ -203,7 +165,7 @@ TEST(InprocClientTest, ConcurrentCreateSharesRuntime) {
   std::vector<std::thread> threads;
   for (int i = 0; i != 8; ++i) {
     threads.emplace_back([&] {
-      StatusOr<Client> c = Client::Create(SyntheticOptions());
+      StatusOr<Client> c = Client::Create(ServerOptions());
       ASSERT_THAT(c, IsOk());
       ASSERT_THAT(c->GetSidecarVersion(), IsOk());
       std::scoped_lock lk(mu);
@@ -220,7 +182,7 @@ TEST(InprocClientTest, TeardownStopsCoreThreads) {
   WaitForCoreThreads(0);
   ASSERT_EQ(CoreThreads(), 0);
   {
-    StatusOr<Client> client = Client::Create(SyntheticOptions());
+    StatusOr<Client> client = Client::Create(ServerOptions());
     ASSERT_THAT(client, IsOk());
     EXPECT_GT(CoreThreads(), 0);
   }
@@ -228,68 +190,21 @@ TEST(InprocClientTest, TeardownStopsCoreThreads) {
   EXPECT_EQ(CoreThreads(), 0);
 }
 
-/// @test A crash while another thread is mid-read fails that read with
-/// UNAVAILABLE within the stop bound instead of hanging it.
-TEST(InprocClientTest, CrashWhileAnotherThreadReadsIsBounded) {
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
-  ASSERT_THAT(client, IsOk());
-  StatusOr<ObjectReader> reader = client->ReadObject("b", "sized/2000000000");
-  ASSERT_THAT(reader, IsOk());
-  std::atomic<bool> started{false};
-  Status result;
-  std::thread consumer([&] {
-    for (;;) {
-      StatusOr<std::optional<absl::Cord>> chunk = reader->Next();
-      started = true;
-      if (!chunk) {
-        result = chunk.status();
-        return;
-      }
-      if (!*chunk) return;
-    }
-  });
-  while (!started) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-  std::chrono::steady_clock::time_point const t0 =
-      std::chrono::steady_clock::now();
-  CrashCore(*client);
-  consumer.join();
-  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(5));
-  EXPECT_THAT(result, StatusIs(StatusCode::kUnavailable));
-}
-
-/// @test Destroying an ObjectDescriptor after its core crashed is bounded by
-/// CloseObject's deadline (a dead descriptor channel fails fast).
-TEST(InprocClientTest, DestructorBoundsCloseWhenCoreStopped) {
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
-  ASSERT_THAT(client, IsOk());
-  StatusOr<ObjectDescriptor> descriptor = client->OpenObject("b", "sized/1024");
-  ASSERT_THAT(descriptor, IsOk());
-  CrashCore(*client);
-  std::chrono::steady_clock::time_point const start =
-      std::chrono::steady_clock::now();
-  {
-    ObjectDescriptor closing = *std::move(descriptor);
-  }
-  EXPECT_LT(std::chrono::steady_clock::now() - start,
-            std::chrono::milliseconds(1200));
-}
-
 /// @test The core reports this process's pid, and so does the Client.
 TEST(InprocClientTest, VersionReportsOwnPid) {
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
+  StatusOr<Client> client = Client::Create(ServerOptions());
   ASSERT_THAT(client, IsOk());
   StatusOr<SidecarVersion> version = client->GetSidecarVersion();
   ASSERT_THAT(version, IsOk());
   EXPECT_EQ(static_cast<int>(version->pid), ::getpid());
   EXPECT_EQ(client->sidecar_pid(), ::getpid());
-  EXPECT_TRUE(version->synthetic);
 }
 
 /// @test GetStats describes this process: live RSS, the process's own thread
 /// count, and no allocation count (the core allocates through this program's
 /// malloc, which the core's counter never sees).
 TEST(InprocClientTest, StatsAreProcessWide) {
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
+  StatusOr<Client> client = Client::Create(ServerOptions());
   ASSERT_THAT(client, IsOk());
   StatusOr<SidecarStats> stats = client->GetSidecarStats();
   ASSERT_THAT(stats, IsOk());
@@ -300,34 +215,12 @@ TEST(InprocClientTest, StatsAreProcessWide) {
   EXPECT_LE(static_cast<std::int64_t>(stats->threads), threads + 2);
 }
 
-/// @test The abstract-socket link serves the same API end to end; unknown
-/// link names are rejected.
-TEST(InprocClientTest, LinkModes) {
-  ClientOptions abstract = SyntheticOptions();
-  abstract.sidecar_args.emplace_back("--link=abstract");
-  abstract.channels = 2;
-  StatusOr<Client> client = Client::Create(abstract);
-  ASSERT_THAT(client, IsOk());
-  StatusOr<ObjectMetadata> meta = client->InsertObject(
-      "b", "abstract-x", absl::Cord(std::string(70000, 'k')));
-  ASSERT_THAT(meta, IsOk());
-  StatusOr<ObjectReader> reader = client->ReadObject("b", "abstract-x");
-  ASSERT_THAT(reader, IsOk());
-  StatusOr<std::uint64_t> got = ReadSize(*reader);
-  ASSERT_THAT(got, IsOk());
-  EXPECT_EQ(*got, 70000U);
-
-  ClientOptions bogus = SyntheticOptions();
-  bogus.sidecar_args.emplace_back("--link=tcp");
-  EXPECT_THAT(Client::Create(bogus), StatusIs(StatusCode::kInvalidArgument));
-}
-
 /// @test The core serves when Create() returns (the C ABI starts it
 /// synchronously), so even a short readiness timeout succeeds — the sidecar
 /// variant would need its spawn time on top.
 TEST(InprocClientTest, ReadyWhenStartReturns) {
   for (int i = 0; i != 5; ++i) {
-    ClientOptions options = SyntheticOptions();
+    ClientOptions options = ServerOptions();
     options.readiness_timeout = std::chrono::milliseconds(50);
     StatusOr<Client> client = Client::Create(options);
     ASSERT_THAT(client, IsOk()) << "attempt " << i;
@@ -345,89 +238,33 @@ TEST(InprocClientTest, StartFailureLeavesNoThreads) {
   std::string const saved = old == nullptr ? std::string() : old;
   ::setenv("GOOGLE_APPLICATION_CREDENTIALS",
            "/nonexistent/gcs-core-test-adc.json", 1);
-  ClientOptions live;  // no --synthetic: the core builds real clients
-  live.sidecar_args = {"--worker-threads=2"};
-  StatusOr<Client> client = Client::Create(live);
+  StatusOr<Client> client = Client::Create(ServerOptions());
   if (old == nullptr) {
     ::unsetenv("GOOGLE_APPLICATION_CREDENTIALS");
   } else {
     ::setenv("GOOGLE_APPLICATION_CREDENTIALS", saved.c_str(), 1);
   }
   EXPECT_THAT(client, StatusIs(StatusCode::kFailedPrecondition));
-  EXPECT_THAT(client.status().message(), HasSubstr("core clients"));
-  WaitForCoreThreads(0);
-  EXPECT_EQ(CoreThreads(), 0);
-}
-
-/// @test A reader keeps its core alive after the last Client is gone (the
-/// wrapper's objects share the connection), the read completes, and the core
-/// stops once the reader goes too. Destroying a Client therefore never cuts
-/// an RPC that is still in use.
-TEST(InprocClientTest, ReaderOutlivesLastClient) {
-  WaitForCoreThreads(0);
-  std::optional<ObjectReader> reader;
-  {
-    StatusOr<Client> client = Client::Create(SyntheticOptions());
-    ASSERT_THAT(client, IsOk());
-    StatusOr<ObjectReader> r = client->ReadObject("b", "sized/20000000");
-    ASSERT_THAT(r, IsOk());
-    reader.emplace(*std::move(r));
-  }
-  EXPECT_GT(CoreThreads(), 0);
-  StatusOr<std::uint64_t> got = ReadSize(*reader);
-  ASSERT_THAT(got, IsOk());
-  EXPECT_EQ(*got, 20'000'000U);
-  reader.reset();
+  EXPECT_THAT(client.status().message(),
+              AllOf(HasSubstr("building the storage clients"),
+                    HasSubstr("GOOGLE_APPLICATION_CREDENTIALS")));
   WaitForCoreThreads(0);
   EXPECT_EQ(CoreThreads(), 0);
 }
 
 /// @test Core-thread CPU is reported in-process and grows with work.
 TEST(InprocClientTest, CoreThreadCpuGrowsWithWork) {
-  StatusOr<Client> client = Client::Create(SyntheticOptions());
+  StatusOr<Client> client = Client::Create(ServerOptions());
   ASSERT_THAT(client, IsOk());
   std::optional<std::uint64_t> const before = client->core_thread_cpu_us();
   ASSERT_TRUE(before.has_value());
-  StatusOr<ObjectReader> reader = client->ReadObject("b", "sized/200000000");
-  ASSERT_THAT(reader, IsOk());
-  ASSERT_THAT(ReadSize(*reader), IsOk());
+  // Each Stats call reads /proc on a core thread; enough of them to move
+  // the counter past the scheduler's clock-tick granularity.
+  for (int i = 0; i != 2000; ++i)
+    ASSERT_THAT(client->GetSidecarStats(), IsOk());
   std::optional<std::uint64_t> const after = client->core_thread_cpu_us();
   ASSERT_TRUE(after.has_value());
   EXPECT_GT(*after, *before);
-}
-
-/// @test Thread hooks run on every core thread at start and stop, with the
-/// registered data pointer, for cores started after registration.
-TEST(InprocClientTest, ThreadHooksRunOnCoreThreads) {
-  // Static: the hooks' data must outlive every core thread, and a thread that
-  // outlived a bounded shutdown would still call `on_stop`.
-  struct Counters {
-    std::atomic<int> starts{0};
-    std::atomic<int> stops{0};
-  };
-  static Counters counters;
-  counters.starts = 0;
-  counters.stops = 0;
-  inproc::ThreadHooks hooks;
-  hooks.on_start = [](void* data) { ++static_cast<Counters*>(data)->starts; };
-  hooks.on_stop = [](void* data) { ++static_cast<Counters*>(data)->stops; };
-  hooks.data = &counters;
-  inproc::SetThreadHooks(hooks);
-  {
-    ClientOptions options = SyntheticOptions();
-    options.sidecar_args.emplace_back("--chunk-size=8191");  // a fresh core
-    StatusOr<Client> client = Client::Create(options);
-    ASSERT_THAT(client, IsOk());
-    EXPECT_GE(counters.starts.load(), 2);
-  }
-  inproc::SetThreadHooks(inproc::ThreadHooks{});
-  std::chrono::steady_clock::time_point const deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (counters.stops.load() < counters.starts.load() &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
-  EXPECT_EQ(counters.stops.load(), counters.starts.load());
 }
 
 }  // namespace

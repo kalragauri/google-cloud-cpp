@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The process-boundary backend: the core runs as the `gcs-core-sidecar`
-// child process and the channels are `unix:` sockets to it.
+// The process-boundary backend: the shared `gcs-core-server` runs as a child
+// process in its 1:1 mode and the channels are `unix:` sockets to it.
 
 #include "absl/strings/str_cat.h"
 #include "absl/strings/str_join.h"
@@ -78,14 +78,13 @@ class SidecarBackend : public CoreBackend {
 
   void Stop() override {
     if (!process_) return;
-    // Closing the lifetime pipe is the shutdown signal; no RPC is needed.
     process_->Terminate();
     process_.reset();
   }
 
   void Kill() override {
     if (!process_) return;
-    process_->Terminate(std::chrono::milliseconds(0));
+    process_->Kill();
     process_.reset();
   }
 
@@ -115,6 +114,7 @@ StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
     std::vector<std::string> const& sockets_in_use) {
   StatusOr<std::string> binary = ResolveSidecarPath(options.sidecar_path);
   if (!binary) return std::move(binary).status();
+  if (Status s = ValidateServerFlags(options.sidecar_args); !s.ok()) return s;
   std::string socket;
   if (!options.socket_path.empty()) {
     socket = options.socket_path;

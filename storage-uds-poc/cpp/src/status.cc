@@ -16,7 +16,7 @@
 
 namespace gcs_core::internal {
 
-namespace v0 = ::gcs::core::v0;
+namespace pb = ::gcscore::v1;
 
 static_assert(static_cast<int>(grpc::StatusCode::UNAUTHENTICATED) ==
                   static_cast<int>(google::cloud::StatusCode::kUnauthenticated),
@@ -31,41 +31,79 @@ Status FromGrpc(grpc::Status const& status) {
                 status.error_message());
 }
 
-ObjectMetadata FromProto(v0::ObjectMetadata const& m) {
+ObjectMetadata FromProto(pb::ObjectMeta const& m, std::string const& bucket,
+                         std::string const& object) {
   ObjectMetadata out;
-  out.bucket = m.bucket();
-  out.name = m.name();
+  out.bucket = bucket;
+  out.name = object;
   out.generation = m.generation();
   out.metageneration = m.metageneration();
-  out.size = m.size();
+  out.size = static_cast<std::uint64_t>(m.size());
   out.content_type = m.content_type();
-  if (m.has_crc32c()) out.crc32c = m.crc32c();
-  out.md5_hash = m.md5_hash();
-  out.etag = m.etag();
-  out.storage_class = m.storage_class();
+  // The server reports 0 when the object has no CRC32C; a real CRC32C of 0 is
+  // indistinguishable and treated as absent.
+  if (m.crc32c() != 0) out.crc32c = m.crc32c();
   return out;
 }
 
-void ToProto(WriteOptions const& options, std::string const& bucket,
-             std::string const& object, v0::WriteSpec& spec) {
-  spec.set_bucket(bucket);
-  spec.set_object(object);
-  if (options.size_hint) spec.set_size_hint(*options.size_hint);
-  spec.set_content_type(options.content_type);
+ObjectMetadata FromProto(pb::ListedObject const& m, std::string const& bucket) {
+  ObjectMetadata out;
+  out.bucket = bucket;
+  out.name = m.name();
+  out.generation = m.generation();
+  out.metageneration = m.metageneration();
+  out.size = static_cast<std::uint64_t>(m.size());
+  out.content_type = m.content_type();
+  out.storage_class = m.storage_class();
+  if (m.crc32c() != 0) out.crc32c = m.crc32c();
+  out.updated = std::chrono::system_clock::time_point(
+      std::chrono::seconds(m.updated_unix_secs()));
+  return out;
+}
+
+BucketMetadata FromProto(pb::ListedBucket const& m) {
+  BucketMetadata out;
+  out.name = m.name();
+  out.location = m.location();
+  out.storage_class = m.storage_class();
+  out.metageneration = m.metageneration();
+  out.created = std::chrono::system_clock::time_point(
+      std::chrono::seconds(m.created_unix_secs()));
+  return out;
+}
+
+pb::WriteHeader ToWriteHeader(WriteOptions const& options,
+                              std::string const& bucket,
+                              std::string const& object,
+                              pb::Transport transport) {
+  pb::WriteHeader header;
+  header.set_bucket(bucket);
+  header.set_object(object);
+  header.set_content_type(options.content_type);
   if (options.if_generation_match) {
-    spec.set_if_generation_match(*options.if_generation_match);
+    header.set_if_generation_match(*options.if_generation_match);
   }
+  // `known_size` selects the core's upload strategy: set, the crate uploads
+  // in one request when the size is below its resumable threshold; unset, it
+  // streams a resumable upload with bounded memory.
   switch (options.mode) {
     case UploadMode::kAuto:
-      spec.set_upload_mode(v0::WriteSpec::UPLOAD_MODE_AUTO);
-      break;
     case UploadMode::kSingleShot:
-      spec.set_upload_mode(v0::WriteSpec::UPLOAD_MODE_SINGLE_SHOT);
+      if (options.size_hint) {
+        header.set_known_size(static_cast<std::int64_t>(*options.size_hint));
+      }
       break;
     case UploadMode::kResumable:
-      spec.set_upload_mode(v0::WriteSpec::UPLOAD_MODE_RESUMABLE);
       break;
   }
+  // `chunk_size` stays 0: it is the crate's resumable buffer (8 MiB default,
+  // the same as the native baseline), not the size of the messages we send.
+  header.set_transport(transport);
+  return header;
+}
+
+std::pair<std::int64_t, std::int64_t> ToOffsetLength(ReadRange range) {
+  return {range.offset, range.limit == 0 ? -1 : range.limit};
 }
 
 }  // namespace gcs_core::internal

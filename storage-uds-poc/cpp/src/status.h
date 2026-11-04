@@ -15,20 +15,33 @@
 #ifndef GCS_UDS_POC_CPP_SRC_STATUS_H
 #define GCS_UDS_POC_CPP_SRC_STATUS_H
 
-#include "gcs/core/v0/storage_core.pb.h"
 #include "gcs_core/client.h"
+#include "gcscore.pb.h"
 #include <grpcpp/support/status.h>
 
 namespace gcs_core::internal {
 
 /// gRPC status codes and google::cloud::StatusCode share numbering, so the
-/// sidecar's status is surfaced unchanged.
+/// server's status is surfaced unchanged.
 Status FromGrpc(grpc::Status const& status);
 
-ObjectMetadata FromProto(::gcs::core::v0::ObjectMetadata const& m);
+/// `gcscore.v1` metadata does not repeat the bucket and object name; the
+/// caller supplies them from its request.
+ObjectMetadata FromProto(::gcscore::v1::ObjectMeta const& m,
+                         std::string const& bucket, std::string const& object);
+ObjectMetadata FromProto(::gcscore::v1::ListedObject const& m,
+                         std::string const& bucket);
+BucketMetadata FromProto(::gcscore::v1::ListedBucket const& m);
 
-void ToProto(WriteOptions const& options, std::string const& bucket,
-             std::string const& object, ::gcs::core::v0::WriteSpec& spec);
+/// The first message of a `WriteObject` stream for `options`.
+::gcscore::v1::WriteHeader ToWriteHeader(WriteOptions const& options,
+                                         std::string const& bucket,
+                                         std::string const& object,
+                                         ::gcscore::v1::Transport transport);
+
+/// `ReadRange` → `(offset, length)` as the server reads them: `length < 0`
+/// reads to the end, a negative `offset` reads the last `-offset` bytes.
+std::pair<std::int64_t, std::int64_t> ToOffsetLength(ReadRange range);
 
 }  // namespace gcs_core::internal
 

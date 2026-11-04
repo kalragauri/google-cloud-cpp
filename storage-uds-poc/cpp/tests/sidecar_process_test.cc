@@ -23,6 +23,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -109,7 +110,7 @@ void WaitForFile(std::string const& path) {
 /// non-executable configured path is an error, never a silent fallback.
 TEST(SidecarProcessTest, ResolveConfiguredPath) {
   std::string const sidecar = BuiltSidecar();
-  ASSERT_FALSE(sidecar.empty()) << "GCS_CORE_SIDECAR must point at the build";
+  ASSERT_FALSE(sidecar.empty()) << "GCS_CORE_SERVER must point at the build";
   ScopedEnv env(kSidecarEnvVar, "/nonexistent/from-env");
   StatusOr<std::string> resolved = ResolveSidecarPath(sidecar);
   ASSERT_THAT(resolved, IsOk());
@@ -130,7 +131,7 @@ TEST(SidecarProcessTest, ResolveFromEnvironment) {
     ASSERT_THAT(resolved, IsOk());
     EXPECT_EQ(*resolved, sidecar);
   }
-  ScopedEnv env(kSidecarEnvVar, "/nonexistent/gcs-core-sidecar");
+  ScopedEnv env(kSidecarEnvVar, "/nonexistent/gcs-core-server");
   StatusOr<std::string> bad = ResolveSidecarPath("");
   EXPECT_THAT(bad, StatusIs(StatusCode::kFailedPrecondition));
   EXPECT_THAT(bad.status().message(), HasSubstr(std::string(kSidecarEnvVar)));
@@ -143,13 +144,19 @@ TEST(SidecarProcessTest, ResolveSiblingNextToExecutable) {
   std::string const exe_dir = SelfDirectory();
   ASSERT_FALSE(exe_dir.empty());
   std::string const sibling = exe_dir + "/" + std::string(kSidecarBinaryName);
-  ::unlink(sibling.c_str());
-  ASSERT_EQ(::symlink(sidecar.c_str(), sibling.c_str()), 0);
+  // The build copies the server next to the test binaries; only plant (and
+  // later remove) a sibling when it is not already there, so the test never
+  // deletes the build's own server.
+  bool const planted = sibling != sidecar;
+  if (planted) {
+    ::unlink(sibling.c_str());
+    ASSERT_EQ(::symlink(sidecar.c_str(), sibling.c_str()), 0);
+  }
 
   ScopedEnv env(kSidecarEnvVar, std::nullopt);
   ScopedEnv path("PATH", "/nonexistent");
   StatusOr<std::string> resolved = ResolveSidecarPath("");
-  ::unlink(sibling.c_str());
+  if (planted) ::unlink(sibling.c_str());
 
   ASSERT_THAT(resolved, IsOk());
   EXPECT_EQ(*resolved, sibling);
@@ -195,14 +202,23 @@ TEST(SidecarProcessTest, ValidateSocketPath) {
   EXPECT_THAT(ValidateSocketPath(""), StatusIs(StatusCode::kInvalidArgument));
 }
 
-/// @test The sidecar exits on its own when its lifetime pipe closes, which
-/// is what happens when the parent is killed. Terminate() closes only the pipe
-/// first, so a fast exit proves the pipe path works.
-TEST(SidecarProcessTest, ExitsWhenLifetimePipeCloses) {
-  std::string const socket =
-      "/tmp/gcs-core-pipe-" + std::to_string(::getpid()) + ".sock";
+/// Server flags for a hermetic child: no GCS endpoint, no shared memory.
+std::vector<std::string> HermeticArgs() {
+  return {"--endpoint=http://127.0.0.1:1", "--shm-size=0",
+          "--grpc-subchannels=1", "--worker-threads=1"};
+}
+
+std::string TestSocket(std::string_view tag) {
+  return "/tmp/gcs-core-" + std::string(tag) + "-" +
+         std::to_string(::getpid()) + ".sock";
+}
+
+/// @test Terminate() sends SIGTERM first; the server drains, exits 0 well
+/// within the grace period and removes its own socket.
+TEST(SidecarProcessTest, TerminateIsGraceful) {
+  std::string const socket = TestSocket("graceful");
   StatusOr<std::unique_ptr<SidecarProcess>> process =
-      SidecarProcess::Spawn(BuiltSidecar(), socket, {"--synthetic"});
+      SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
   ASSERT_THAT(process, IsOk());
   WaitForFile(socket);
   struct stat st{};
@@ -216,6 +232,44 @@ TEST(SidecarProcessTest, ExitsWhenLifetimePipeCloses) {
   EXPECT_THAT((*process)->ExitDescription(), HasSubstr("exited with status 0"));
   EXPECT_LT(elapsed, std::chrono::seconds(1));
   EXPECT_NE(::stat(socket.c_str(), &st), 0) << "socket should be removed";
+}
+
+/// @test Kill() is SIGKILL, as in a crash: no drain, and the wrapper still
+/// removes the socket the server could not.
+TEST(SidecarProcessTest, KillIsImmediate) {
+  std::string const socket = TestSocket("kill");
+  StatusOr<std::unique_ptr<SidecarProcess>> process =
+      SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
+  ASSERT_THAT(process, IsOk());
+  WaitForFile(socket);
+  (*process)->Kill();
+  EXPECT_TRUE((*process)->Exited());
+  EXPECT_THAT((*process)->ExitDescription(), HasSubstr("killed by signal 9"));
+  struct stat st{};
+  EXPECT_NE(::stat(socket.c_str(), &st), 0) << "socket should be removed";
+}
+
+/// @test The child asks for PR_SET_PDEATHSIG, which Linux ties to the
+/// spawning *thread*. Spawning from a thread that then exits must not take
+/// the server down with it, because Spawn() forks from a long-lived helper.
+TEST(SidecarProcessTest, SurvivesSpawningThreadExit) {
+  std::string const socket = TestSocket("thread-exit");
+  StatusOr<std::unique_ptr<SidecarProcess>> process =
+      Status(StatusCode::kUnknown, "not spawned");
+  // The thread waits for the socket before exiting: the server arms
+  // PR_SET_PDEATHSIG during startup, and a thread that is already gone by
+  // then would never trigger it.
+  std::thread([&] {
+    process = SidecarProcess::Spawn(BuiltSidecar(), socket, HermeticArgs());
+    WaitForFile(socket);
+  }).join();
+  ASSERT_THAT(process, IsOk());
+  // Long enough for a SIGTERM from the kernel to have been delivered and
+  // acted on: the server exits within milliseconds of SIGTERM.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  EXPECT_FALSE((*process)->Exited()) << (*process)->ExitDescription();
+  struct stat st{};
+  EXPECT_EQ(::stat(socket.c_str(), &st), 0);
 }
 
 /// @test Pre-existing regular files and symlinks at the socket path are
@@ -237,7 +291,7 @@ TEST(SidecarProcessTest, RegularFileSocketPathPreserved) {
               StatusIs(StatusCode::kFailedPrecondition));
   EXPECT_THAT(ValidateSocketPath(link),
               StatusIs(StatusCode::kFailedPrecondition));
-  EXPECT_THAT(SidecarProcess::Spawn(BuiltSidecar(), regular, {"--synthetic"}),
+  EXPECT_THAT(SidecarProcess::Spawn(BuiltSidecar(), regular, HermeticArgs()),
               StatusIs(StatusCode::kFailedPrecondition));
 
   struct stat st{};

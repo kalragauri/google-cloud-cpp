@@ -27,7 +27,7 @@ namespace gcs_core {
 namespace internal {
 
 /**
- * Where the core runs: a sidecar process (`sidecar_backend.cc`) or tokio
+ * Where the server runs: a child process (`sidecar_backend.cc`) or Tokio
  * threads inside this process (`inproc_backend.cc`).
  *
  * `Connection` owns the stubs, the readiness poll and the crash-restart
@@ -50,7 +50,7 @@ class CoreBackend {
   virtual std::string const& SocketPath() const = 0;
 
   /// Starts the core and returns one channel per configured channel. The
-  /// channels may still be connecting; the caller polls `GetVersion`.
+  /// channels may still be connecting; the caller polls `Ping`.
   virtual StatusOr<std::vector<std::shared_ptr<grpc::Channel>>> Start() = 0;
   /// True once the core stopped on its own after `Start()`.
   virtual bool Exited() = 0;
@@ -59,15 +59,14 @@ class CoreBackend {
   /// Orderly, bounded stop.
   virtual void Stop() = 0;
   /// Stop without a grace period (readiness timeout, a failed start, test
-  /// crash hooks). The sidecar gets its immediate-terminate sequence (close
-  /// the lifetime pipe, SIGTERM, SIGKILL), exactly what a readiness timeout
-  /// did before this seam existed; the in-process core is aborted without
-  /// draining, so peers see their connections drop as after a crash.
+  /// crash hooks). The sidecar gets SIGKILL, as in a crash. The in-process
+  /// server has no abort entry point, so it gets the same orderly stop as
+  /// `Stop()`; peers still see their connections close.
   virtual void Kill() = 0;
 
   /// Pid of the process running the core.
   virtual int pid() const = 0;
-  /// For messages: `sidecar /path/to/gcs-core-sidecar`, `in-process core`.
+  /// For messages: `sidecar /path/to/gcs-core-server`, `in-process server`.
   virtual std::string Describe() const = 0;
   /// CPU time consumed by the core's threads when they live in this process;
   /// `nullopt` for a separate process (its `GetStats` covers that).
@@ -85,6 +84,11 @@ StatusOr<std::unique_ptr<CoreBackend>> MakeCoreBackend(
 /// Channel arguments for a connection to the core on this host. Shared by
 /// both backends so a benchmark row differs only by the boundary.
 grpc::ChannelArguments LocalChannelArguments(int channel_index);
+
+/// Rejects `ClientOptions::sidecar_args` the wrapper sets itself
+/// (`--socket`, `--pdeathsig`) or that would expose the server beyond this
+/// host (`--tcp`), in either `--flag value` or `--flag=value` form.
+Status ValidateServerFlags(std::vector<std::string> const& args);
 
 }  // namespace internal
 }  // namespace gcs_core

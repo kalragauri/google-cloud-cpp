@@ -60,27 +60,17 @@ MATCHER_P(StatusIs, code, "status has expected code") {
   return false;
 }
 
-/// A core that serves deterministic data without GCS; small thread count so
-/// the suite does not start dozens of workers per test in-process.
-inline ClientOptions SyntheticOptions() {
+/// A real `gcs-core-server` that never reaches GCS: the endpoint points at a
+/// closed local port, so these tests exercise only the lifecycle RPCs (`Ping`,
+/// `Stats`) and stay hermetic. Data-plane mapping is covered against a fake
+/// `GcsCore` (client_fake_test.cc) and end to end by the quickstart. The
+/// thread and subchannel counts keep each test's core small; shared memory
+/// is off because the wrapper does not use it.
+inline ClientOptions ServerOptions() {
   ClientOptions options;
-  options.sidecar_args = {"--synthetic"};
-  if (kInProcess) options.sidecar_args.emplace_back("--worker-threads=2");
+  options.sidecar_args = {"--endpoint=http://127.0.0.1:1", "--shm-size=0",
+                          "--grpc-subchannels=1", "--worker-threads=2"};
   return options;
-}
-
-inline StatusOr<std::uint64_t> ReadSize(ObjectReader& reader,
-                                        std::size_t* max_chunk = nullptr) {
-  std::uint64_t total = 0;
-  for (;;) {
-    StatusOr<std::optional<absl::Cord>> chunk = reader.Next();
-    if (!chunk.ok()) return std::move(chunk).status();
-    if (!*chunk) return total;
-    if (max_chunk != nullptr) {
-      *max_chunk = std::max(*max_chunk, (*chunk)->size());
-    }
-    total += (*chunk)->size();
-  }
 }
 
 inline bool ProcessAlive(int pid) { return pid > 0 && ::kill(pid, 0) == 0; }
@@ -96,8 +86,8 @@ inline void WaitForExit(int pid) {
 /// Crashes the core serving `client` from outside the wrapper and returns
 /// once it is gone. Sidecar: SIGKILL to the child, so the wrapper discovers
 /// the death through `waitpid` exactly as in production. In-process there is
-/// no outside: the core is aborted through the test hook (no frames reach the
-/// channels), which is what the wrapper would see if the core died.
+/// no outside and the server has no abort entry point, so the test hook stops
+/// the core; the wrapper then sees its channels fail as if the core died.
 inline void CrashCore(Client const& client) {
   int const pid = client.sidecar_pid();
   if (kInProcess) {

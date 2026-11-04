@@ -28,19 +28,20 @@
 #include <vector>
 
 /**
- * Thin C++ wrapper over the Rust `core-sdk` (POC).
+ * Thin C++ wrapper over the shared Rust gRPC-over-UDS server (POC).
  *
- * The wrapper contains no storage logic: every call is forwarded over gRPC to
- * the core, which runs the Rust `google-cloud-storage` crate. Retries,
- * resumable-upload state, checksum validation and credentials (Application
- * Default Credentials) all live in the core. Statuses are returned exactly as
- * the core reports them.
+ * The wrapper contains no storage logic: every call is forwarded over gRPC
+ * (`gcscore.v1.GcsCore`) to `storage-grpc-uds`, which runs the Rust
+ * `google-cloud-storage` crate. Retries, resumable-upload state, checksum
+ * validation and credentials (Application Default Credentials) all live in
+ * the server. Statuses are returned exactly as the server reports them.
  *
- * The same header serves two libraries that differ only in where the core
- * runs: `gcs_core` starts it as the `gcs-core-sidecar` process and talks to
- * it over a Unix domain socket; `gcs_core_inproc` links it in and runs it on
- * threads of this process. Fields and functions that only make sense for one
- * of them say so.
+ * The same header serves two libraries that differ only in where the server
+ * runs: `gcs_core` starts `gcs-core-server` as a child process and talks to
+ * it over a Unix domain socket; `gcs_core_inproc` links the server's static
+ * library and runs it on threads of this process, reached over an
+ * abstract-namespace Unix socket. Fields and functions that only make sense
+ * for one of them say so.
  */
 namespace gcs_core {
 
@@ -53,8 +54,7 @@ namespace internal {
 class Connection;
 class ReaderImpl;
 class WriterImpl;
-class AppendableWriterImpl;
-/// Test hook: terminates the core serving `client` without draining, as a
+/// Test hook: terminates the server serving `client` without draining, as a
 /// crash would; the next failing call restarts it.
 void KillCoreForTesting(Client const& client);
 }  // namespace internal
@@ -67,9 +67,19 @@ struct ObjectMetadata {
   std::uint64_t size = 0;
   std::string content_type;
   std::optional<std::uint32_t> crc32c;
-  std::string md5_hash;
-  std::string etag;
+  /// Only set by `ListObjects`; other calls leave it empty.
   std::string storage_class;
+  /// Only set by `ListObjects` (second resolution).
+  std::chrono::system_clock::time_point updated;
+};
+
+struct BucketMetadata {
+  std::string name;
+  std::string location;
+  std::string storage_class;
+  std::int64_t metageneration = 0;
+  /// Second resolution.
+  std::chrono::system_clock::time_point created;
 };
 
 /// `limit == 0` reads to the end. A negative `offset` reads the last
@@ -79,6 +89,9 @@ struct ReadRange {
   std::int64_t limit = 0;
 };
 
+/// How the server uploads. `kAuto` and `kSingleShot` pass `size_hint` to the
+/// server (single request below the crate's 16 MiB resumable threshold);
+/// `kResumable` withholds it, so the server streams a resumable upload.
 enum class UploadMode { kAuto, kSingleShot, kResumable };
 
 struct WriteOptions {
@@ -92,6 +105,9 @@ struct WriteOptions {
 struct ListObjectsRequest {
   std::string prefix;
   std::string delimiter;
+  std::string start_offset;
+  std::string end_offset;
+  bool versions = false;
   std::int32_t page_size = 0;
   std::string page_token;
 };
@@ -102,18 +118,25 @@ struct ListObjectsPage {
   std::string next_page_token;
 };
 
+struct ListBucketsRequest {
+  std::string prefix;
+  std::int32_t page_size = 0;
+  std::string page_token;
+};
+
+struct ListBucketsPage {
+  std::vector<BucketMetadata> buckets;
+  std::string next_page_token;
+};
+
 struct SidecarVersion {
-  std::string sidecar_version;
-  std::string storage_crate_version;
   /// Pid of the process serving the core: the sidecar, or this process.
   std::uint32_t pid = 0;
-  bool bidi_enabled = false;
-  bool synthetic = false;
 };
 
 /// Cumulative counters of the process serving the core; diff two snapshots.
-/// In-process they describe this process itself and `allocated_bytes` is 0
-/// (the core's allocations go through the application's own `malloc`).
+/// In-process they describe this process itself. `allocated_bytes` is always
+/// 0: the shared server does not count allocations.
 struct SidecarStats {
   std::uint64_t user_cpu_us = 0;
   std::uint64_t system_cpu_us = 0;
@@ -124,22 +147,23 @@ struct SidecarStats {
 };
 
 struct ClientOptions {
-  /// Sidecar binary. Empty: `$GCS_CORE_SIDECAR`, then `gcs-core-sidecar`
-  /// next to the running executable, then `gcs-core-sidecar` on `PATH`.
-  /// Sidecar variant only; the in-process variant rejects a non-empty value.
+  /// Server binary. Empty: `$GCS_CORE_SERVER`, then `gcs-core-server` next to
+  /// the running executable, then `gcs-core-server` on `PATH`. Sidecar
+  /// variant only; the in-process variant rejects a non-empty value.
   std::string sidecar_path;
   /// Socket path. Empty: `$XDG_RUNTIME_DIR/gcs-core-<pid>.sock`, else
   /// `/tmp/gcs-core-<uid>/<pid>.sock`. Sidecar variant only; the in-process
-  /// variant rejects a non-empty value.
+  /// variant rejects a non-empty value (it binds an abstract socket).
   std::string socket_path;
-  /// Extra core arguments, e.g. `--synthetic` or `--chunk-size=N`. Both
-  /// variants accept the same core flags; the in-process variant adds
-  /// `--link=socketpair|abstract` and rejects `--socket`/`--parent-fd`.
+  /// Extra server flags as for `gcs-core-server`, e.g.
+  /// `--grpc-subchannels=4` or `--worker-threads=8`. Both variants accept the
+  /// same flags; `--socket`, `--pdeathsig` and `--tcp` are set by the wrapper
+  /// or rejected.
   std::vector<std::string> sidecar_args;
   /// Number of independent HTTP/2 connections to the core.
   int channels = 1;
   /// Upper bound for read and write chunk messages (clamped to 16 MiB); 0 lets
-  /// the sidecar choose on reads and uses 1 MiB on writes.
+  /// the server choose on reads and uses 1 MiB on writes.
   std::uint32_t chunk_size_hint = 0;
   /// Must be > 0. Shared connections retain the first caller's timeout for
   /// subsequent crash restarts.
@@ -180,7 +204,7 @@ class ObjectWriter {
   std::unique_ptr<internal::WriterImpl> impl_;
 };
 
-/// Appendable (zonal bucket) upload over the core's BidiWriteObject path.
+/// Appendable (zonal bucket) upload over the server's BidiWriteObject path.
 class AppendableWriter {
  public:
   AppendableWriter(AppendableWriter&&) noexcept;
@@ -188,19 +212,22 @@ class AppendableWriter {
   ~AppendableWriter();
 
   Status Write(absl::Cord const& data);
-  /// Finalizes the object.
+  /// Finalizes the object. Fails with `kFailedPrecondition` if the server
+  /// wrote it over JSON instead of `BidiWriteObject` (it does so when the
+  /// bucket rejects appendable objects or when it was built without the
+  /// unstable bidi cfg); the regular object then exists already.
   StatusOr<ObjectMetadata> Finalize();
-  /// Leaves the object appendable; returns the persisted size.
+  /// Would leave the object appendable. Always `kUnimplemented`: the shared
+  /// server's `WriteObject` finalizes when the stream ends.
   StatusOr<std::int64_t> Close();
 
  private:
   friend class Client;
-  explicit AppendableWriter(
-      std::unique_ptr<internal::AppendableWriterImpl> impl);
-  std::unique_ptr<internal::AppendableWriterImpl> impl_;
+  explicit AppendableWriter(std::unique_ptr<internal::WriterImpl> impl);
+  std::unique_ptr<internal::WriterImpl> impl_;
 };
 
-/// An open object for concurrent ranged reads over the core's
+/// An open object for concurrent ranged reads over the server's
 /// BidiReadObject path. Closes the descriptor on destruction.
 class ObjectDescriptor {
  public:
@@ -209,9 +236,10 @@ class ObjectDescriptor {
   ~ObjectDescriptor();
 
   ObjectMetadata const& metadata() const;
-  /// Reads all `ranges` concurrently. `on_data(index, chunk)` is called on
-  /// the calling thread, possibly interleaving ranges, in order within each
-  /// range. Safe to call from several threads at once.
+  /// Reads all `ranges` concurrently (one `ReadRange` RPC each).
+  /// `on_data(index, chunk)` is called on the calling thread, possibly
+  /// interleaving ranges, in order within each range. Safe to call from
+  /// several threads at once.
   Status ReadRanges(
       std::vector<ReadRange> const& ranges,
       std::function<void(std::size_t, absl::Cord const&)> const& on_data);
@@ -219,9 +247,11 @@ class ObjectDescriptor {
  private:
   friend class Client;
   ObjectDescriptor(std::shared_ptr<internal::Connection> conn,
-                   std::uint64_t handle, ObjectMetadata metadata,
-                   std::uint32_t chunk_size_hint);
+                   std::uint64_t generation, std::uint64_t handle,
+                   ObjectMetadata metadata, std::uint32_t chunk_size_hint);
   std::shared_ptr<internal::Connection> conn_;
+  /// The server generation that issued `handle_`; see `Connection::StubFor`.
+  std::uint64_t generation_ = 0;
   std::uint64_t handle_ = 0;
   ObjectMetadata metadata_;
   std::uint32_t chunk_size_hint_ = 0;
@@ -247,6 +277,9 @@ class Client {
                                         WriteOptions options = {});
   StatusOr<ListObjectsPage> ListObjects(std::string const& bucket,
                                         ListObjectsRequest const& request);
+  /// `project` is a project id or number, with or without `projects/`.
+  StatusOr<ListBucketsPage> ListBuckets(std::string const& project,
+                                        ListBucketsRequest const& request);
   Status DeleteObject(std::string const& bucket, std::string const& object,
                       std::int64_t generation = 0);
   StatusOr<ObjectDescriptor> OpenObject(std::string const& bucket,
