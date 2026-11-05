@@ -17,9 +17,14 @@
 # uploads every CSV, summary JSON, Cloud Monitoring JSON, path report, and log
 # to gs://$OPS/results/$RUN/.
 #
-#   PHASE=probes  S0 probes (quickstart on regional & zonal + Monitoring check)
-#   PHASE=smoke   short-duration smoke run of every workload x comparator
-#   PHASE=full    prescribed >=3 min / 5 min measured matrix
+#   PHASE=probes    S0 probes (quickstart on regional & zonal + Monitoring check)
+#   PHASE=smoke     short-duration smoke run of every workload x comparator
+#   PHASE=full      prescribed >=3 min / 5 min measured matrix (W1-W4 zonal,
+#                   plus regional when ALLOW_REGIONAL_BIDI=1; W5 zonal; W6)
+#   PHASE=regional  W1-W4 on the regional bucket only, for a bucket whose
+#                   project is allow-listed for BidiReadObject (row C2)
+#   PHASE=wt        worker-thread sensitivity: W3 and W4 on zonal for the two
+#                   UDS comparators at WORKER_THREADS=N (N > 0)
 #
 # Enforces plan §7.1 comparison rules:
 #   * Ops Agent active before starting (row D3).
@@ -30,19 +35,45 @@
 #   * `verify_path.py` gates every cell (Cloudpath only, row C1).
 #   * `monitoring.py` queries Cloud Monitoring CPU and Ops Agent memory per
 #     workload window (rows D1/D2).
+#   * Regional BidiReadObject is gated per bucket-owning project; any phase
+#     that reads bidi on the regional bucket first checks the gate and aborts
+#     with a clear message instead of producing 15 PERMISSION_DENIED cells.
 set -uo pipefail
 
 OPS="${OPS:?OPS bucket must be set}"
 PHASE="${PHASE:-smoke}"
-REGIONAL="${REGIONAL:?REGIONAL bucket must be set}"
-ZONAL="${ZONAL:?ZONAL bucket must be set}"
-BUCKET_PREFIX="${BUCKET_PREFIX:?BUCKET_PREFIX must be set}"
+REGIONAL="${REGIONAL:-}"
+ZONAL="${ZONAL:-}"
+BUCKET_PREFIX="${BUCKET_PREFIX:-}"
 ALLOW_REGIONAL_BIDI="${ALLOW_REGIONAL_BIDI:-0}"
 WORKER_THREADS="${WORKER_THREADS:-0}"
 POC="${POC:-$HOME/poc/src/storage-uds-poc}"
 BUILD="$POC/cmake-out"
 RUN="${RUN:-$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="$HOME/poc/results/$RUN"
+
+case "$PHASE" in
+  probes | smoke | full)
+    : "${REGIONAL:?REGIONAL bucket must be set}"
+    : "${ZONAL:?ZONAL bucket must be set}"
+    : "${BUCKET_PREFIX:?BUCKET_PREFIX must be set}"
+    ;;
+  regional)
+    : "${REGIONAL:?REGIONAL bucket must be set}"
+    ;;
+  wt)
+    : "${ZONAL:?ZONAL bucket must be set}"
+    if (( WORKER_THREADS <= 0 )); then
+      echo "FATAL: PHASE=wt requires WORKER_THREADS > 0" >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "FATAL: unknown PHASE=$PHASE" >&2
+    exit 1
+    ;;
+esac
+
 mkdir -p "$OUT"
 cd "$OUT"
 
@@ -84,6 +115,24 @@ stop_daemon() {
     pgrep -x gcs-core-server >/dev/null 2>&1 || break
     sleep 0.05
   done
+}
+
+# Aborts unless the service admits BidiReadObject on the regional bucket. The
+# quickstart prints a "GAP  BidiReadObject" line when the bucket-owning project
+# is not on the allow list; everything else in that run still passes, so the
+# exit code alone cannot be used.
+require_regional_bidi() {
+  local gate_log="gate-quickstart-inproc-regional.log"
+  stop_daemon
+  "$BUILD/quickstart_inproc" --project="$PROJECT" "$REGIONAL" >"$gate_log" 2>&1
+  local rc=$?
+  gcloud storage cp --quiet "$gate_log" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  if (( rc != 0 )) || [[ "$(cat "$gate_log")" == *"GAP  BidiReadObject"* ]]; then
+    echo "FATAL: BidiReadObject is not admitted on gs://$REGIONAL (rc=$rc);" \
+      "see $gate_log" >&2
+    exit 1
+  fi
+  echo "gate: BidiReadObject admitted on gs://$REGIONAL"
 }
 
 rotate() {
@@ -160,10 +209,34 @@ run_cell() {
 COMPS=(native uds-sidecar uds-inproc)
 k=0
 
+# --- PHASE=wt: worker-thread sensitivity on the UDS comparators only ---------
+# Native has no Tokio pool, so it is not a comparator here; the base run (same
+# cells at the default WORKER_THREADS=0) is the reference for
+# `analyze.py --sensitivity`.
+if [[ "$PHASE" == "wt" ]]; then
+  for mode in uds-sidecar uds-inproc; do
+    run_cell "random8k-zonal" "$mode" \
+      --workload=random8k --bucket="$ZONAL" --bucket-type=zonal \
+      --duration-secs="$DUR_SHORT"
+  done
+  for mode in uds-sidecar uds-inproc; do
+    run_cell "bidi-read-48t-zonal" "$mode" \
+      --workload=bidi-read-48t --bucket="$ZONAL" --bucket-type=zonal \
+      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
+  done
+fi
+
 # --- W1-W3 on zonal (and regional when allow-listed) --------------------------
-BIDI_TARGETS=("zonal:$ZONAL")
-if [[ "$ALLOW_REGIONAL_BIDI" == "1" ]]; then
-  BIDI_TARGETS+=("regional:$REGIONAL")
+BIDI_TARGETS=()
+if [[ "$PHASE" == "regional" ]]; then
+  require_regional_bidi
+  BIDI_TARGETS=("regional:$REGIONAL")
+elif [[ "$PHASE" != "wt" ]]; then
+  BIDI_TARGETS=("zonal:$ZONAL")
+  if [[ "$ALLOW_REGIONAL_BIDI" == "1" ]]; then
+    require_regional_bidi
+    BIDI_TARGETS+=("regional:$REGIONAL")
+  fi
 fi
 
 for target in "${BIDI_TARGETS[@]}"; do
@@ -187,28 +260,30 @@ for target in "${BIDI_TARGETS[@]}"; do
   k=$((k + 1))
 done
 
-# --- W5: 48-thread appendable BidiWrite 200 MB object + Finalize (zonal) ------
-for mode in $(rotate "$k" "${COMPS[@]}"); do
-  run_cell "bidi-write-48t-zonal" "$mode" \
-    --workload=bidi-write-48t --bucket="$ZONAL" --bucket-type=zonal \
-    --threads="$THREADS_48" --duration-secs="$DUR_LONG"
-done
-k=$((k + 1))
+if [[ "$PHASE" == "smoke" || "$PHASE" == "full" ]]; then
+  # --- W5: 48-thread appendable BidiWrite 200 MB object + Finalize (zonal) ----
+  for mode in $(rotate "$k" "${COMPS[@]}"); do
+    run_cell "bidi-write-48t-zonal" "$mode" \
+      --workload=bidi-write-48t --bucket="$ZONAL" --bucket-type=zonal \
+      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
+  done
+  k=$((k + 1))
 
-# --- W6: ListObjects (100 items, regional) & ListBuckets (100 items) ----------
-for mode in $(rotate "$k" "${COMPS[@]}"); do
-  run_cell "list-objects-100-regional" "$mode" \
-    --workload=list-objects-100 --bucket="$REGIONAL" --bucket-type=regional \
-    --duration-secs="$DUR_SHORT"
-done
-k=$((k + 1))
+  # --- W6: ListObjects (100 items, regional) & ListBuckets (100 items) --------
+  for mode in $(rotate "$k" "${COMPS[@]}"); do
+    run_cell "list-objects-100-regional" "$mode" \
+      --workload=list-objects-100 --bucket="$REGIONAL" --bucket-type=regional \
+      --duration-secs="$DUR_SHORT"
+  done
+  k=$((k + 1))
 
-for mode in $(rotate "$k" "${COMPS[@]}"); do
-  run_cell "list-buckets-100-project" "$mode" \
-    --workload=list-buckets-100 --project="$PROJECT" \
-    --bucket-prefix="$BUCKET_PREFIX" --duration-secs="$DUR_SHORT"
-done
-k=$((k + 1))
+  for mode in $(rotate "$k" "${COMPS[@]}"); do
+    run_cell "list-buckets-100-project" "$mode" \
+      --workload=list-buckets-100 --project="$PROJECT" \
+      --bucket-prefix="$BUCKET_PREFIX" --duration-secs="$DUR_SHORT"
+  done
+  k=$((k + 1))
+fi
 
 # --- Query Cloud Monitoring CPU & Ops Agent memory per cell window ------------
 # Wait for the final cell's 60 s Monitoring alignment bucket to close and flush

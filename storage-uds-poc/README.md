@@ -65,6 +65,26 @@ ctest --test-dir cmake-out --output-on-failure
 ./cmake-out/quickstart_inproc --zonal ZONAL_BUCKET
 ```
 
+## Benchmark runner phases (`scripts/vm_run.sh`)
+
+The runner executes one comparator at a time, gates every cell on Cloudpath
+(`verify_path.py`), and queries Cloud Monitoring per cell window
+(`monitoring.py`). `PHASE` selects the matrix:
+
+| `PHASE` | Cells | Required variables |
+| --- | --- | --- |
+| `probes` | `quickstart` / `quickstart_inproc` on both buckets + a Monitoring sanity query | `REGIONAL`, `ZONAL`, `BUCKET_PREFIX` |
+| `smoke` | every workload × comparator at second-long durations | same |
+| `full` | W1–W4 on zonal (plus regional when `ALLOW_REGIONAL_BIDI=1`), W5 on zonal, W6; 3 min / 5 min | same |
+| `regional` | W1–W4 on the regional bucket only | `REGIONAL` |
+| `wt` | W3 and W4 on zonal for the two UDS comparators at `WORKER_THREADS=N` (`N > 0`) | `ZONAL`, `WORKER_THREADS` |
+
+Regional `BidiReadObject` is admitted per bucket-owning project
+(preview allow list); `regional`, and `full` with
+`ALLOW_REGIONAL_BIDI=1`, run the `quickstart_inproc` gate first and abort if the
+service answers `PERMISSION_DENIED`. Summaries render with
+`scripts/analyze.py RESULTS_DIR [--doc-tables | --sensitivity BASE_DIR]`.
+
 ## Operational notes
 
 * **Sidecar modes (`SidecarMode::kDaemon` vs `SidecarMode::kChild`).**
