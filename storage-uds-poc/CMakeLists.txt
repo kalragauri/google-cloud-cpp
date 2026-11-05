@@ -76,7 +76,7 @@ find_package(absl CONFIG REQUIRED)
 include(FetchContent)
 set(GCS_CORE_RUST_REPO "https://github.com/kalragauri/google-cloud-rust.git"
     CACHE STRING "google-cloud-rust repository providing storage-grpc-uds")
-set(GCS_CORE_RUST_REF "grpc-uds-cpp"
+set(GCS_CORE_RUST_REF "e432ad1de767f8b8094de70fcb3113ccba67310d"
     CACHE STRING "Commit SHA (preferred) or branch of GCS_CORE_RUST_REPO")
 FetchContent_Declare(
     google_cloud_rust

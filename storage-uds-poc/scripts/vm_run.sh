@@ -100,18 +100,18 @@ if [[ "$PHASE" == "probes" ]]; then
   PROBE_START="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   stop_daemon
   python3 "$VERIFY" "probe-quickstart-regional.path.json" -- \
-    "$BUILD/quickstart" "$REGIONAL" | tee probe-quickstart-regional.log || FAILED=$((FAILED + 1))
+    "$BUILD/quickstart" --project="$PROJECT" "$REGIONAL" | tee probe-quickstart-regional.log || FAILED=$((FAILED + 1))
   python3 "$VERIFY" "probe-quickstart-zonal.path.json" -- \
     "$BUILD/quickstart" --zonal "$ZONAL" | tee probe-quickstart-zonal.log || FAILED=$((FAILED + 1))
   stop_daemon
   python3 "$VERIFY" "probe-quickstart-inproc-regional.path.json" -- \
-    "$BUILD/quickstart_inproc" "$REGIONAL" | tee probe-quickstart-inproc-regional.log || FAILED=$((FAILED + 1))
+    "$BUILD/quickstart_inproc" --project="$PROJECT" "$REGIONAL" | tee probe-quickstart-inproc-regional.log || FAILED=$((FAILED + 1))
   python3 "$VERIFY" "probe-quickstart-inproc-zonal.path.json" -- \
     "$BUILD/quickstart_inproc" --zonal "$ZONAL" | tee probe-quickstart-inproc-zonal.log || FAILED=$((FAILED + 1))
-  sleep 65
+  sleep 90
   PROBE_END="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   python3 "$MON" --project="$PROJECT" --instance-id="$INSTANCE_ID" \
-    --start="$PROBE_START" --end="$PROBE_END" --wait-secs=180 \
+    --start="$PROBE_START" --end="$PROBE_END" --wait-secs=240 \
     --out="probe-monitoring.json" || FAILED=$((FAILED + 1))
   echo "end=$(date -u +%FT%TZ) failed_runs=$FAILED" | tee -a run-info.txt
   gcloud storage cp --quiet "$OUT"/* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
@@ -211,13 +211,15 @@ done
 k=$((k + 1))
 
 # --- Query Cloud Monitoring CPU & Ops Agent memory per cell window ------------
+# Wait for the final cell's 60 s Monitoring alignment bucket to close and flush.
+sleep 90
 echo "######## Querying Cloud Monitoring for ${#SUMMARY_FILES[@]} windows"
 for name in "${SUMMARY_FILES[@]}"; do
   if ! python3 "$MON" \
       --project="$PROJECT" \
       --instance-id="$INSTANCE_ID" \
       --summary-json="$name.summary.json" \
-      --wait-secs=180 \
+      --wait-secs=240 \
       --out="$name.monitoring.json"; then
     echo "  monitoring FAILED for $name" >&2
     FAILED=$((FAILED + 1))
