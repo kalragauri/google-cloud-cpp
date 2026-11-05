@@ -16,9 +16,11 @@
 # comparators (`--mode=native`, `--mode=uds-sidecar`, `--mode=uds-inproc`)
 # through identical public `google::cloud::storage::Client` and
 # `google::cloud::storage::AsyncClient` workload loops.
+find_package(OpenSSL REQUIRED)
+
 add_executable(uds_poc_bench uds_poc_bench.cc)
 target_link_libraries(
     uds_poc_bench
-    PRIVATE absl::cord absl::strings gcs_core_storage_combined
+    PRIVATE absl::cord absl::strings gcs_core_storage_combined OpenSSL::Crypto
             google-cloud-cpp::storage google-cloud-cpp::storage_grpc)
 gcs_uds_poc_warnings(uds_poc_bench)

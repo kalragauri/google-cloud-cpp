@@ -45,6 +45,7 @@
 #include "absl/strings/str_cat.h"
 #include "gcs_core/client.h"
 #include "gcs_core/storage_client.h"
+#include <openssl/crypto.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -999,6 +1000,12 @@ bool ParseFlags(int argc, char* argv[], Config& cfg) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
+  // gRPC's `DefaultEventEngine` worker threads outlive `main()` and tear down
+  // cancelled TLS handshakes asynchronously; disabling OpenSSL 3's `atexit`
+  // handler prevents `OPENSSL_cleanup()` from racing their thread-exit TLS
+  // destructors (`ossl_cleanup_thread`).
+  (void)OPENSSL_init_crypto(OPENSSL_INIT_NO_ATEXIT, nullptr);
+
   Config cfg;
   if (!ParseFlags(argc, argv, cfg)) return 2;
 
@@ -1404,5 +1411,7 @@ int main(int argc, char* argv[]) {
   if (recorder.ops_err() > 0) {
     std::cerr << "first_error: " << recorder.first_error() << "\n";
   }
+  std::cout.flush();
+  std::cerr.flush();
   return recorder.ops_ok() > 0 ? 0 : 1;
 }
