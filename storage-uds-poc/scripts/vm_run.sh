@@ -211,8 +211,9 @@ done
 k=$((k + 1))
 
 # --- Query Cloud Monitoring CPU & Ops Agent memory per cell window ------------
-# Wait for the final cell's 60 s Monitoring alignment bucket to close and flush.
-sleep 90
+# Wait for the final cell's 60 s Monitoring alignment bucket to close and flush
+# (`compute.googleapis.com/instance/cpu/utilization` has up to ~240 s lag).
+sleep "${MONITORING_FLUSH_SECS:-240}"
 echo "######## Querying Cloud Monitoring for ${#SUMMARY_FILES[@]} windows"
 for name in "${SUMMARY_FILES[@]}"; do
   if ! python3 "$MON" \
