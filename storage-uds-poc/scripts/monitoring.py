@@ -45,6 +45,21 @@ class MonitoringError(RuntimeError):
   """Raised when Cloud Monitoring returns an error or an empty time series."""
 
 
+class IncompleteSeriesError(MonitoringError):
+  """Raised when a series has fewer 60 s points than the window has buckets.
+
+  GCE publishes `instance/cpu/utilization` once a minute and makes a sample
+  visible up to ~240 s later, so the last bucket of a window can be missing
+  for several minutes after the workload ends. The caller retries until its
+  deadline and, if the series is still short, keeps the partial report
+  (which `analyze.py` marks) rather than dropping the cell.
+  """
+
+  def __init__(self, message: str, report: Mapping[str, Any]):
+    super().__init__(message)
+    self.report = report
+
+
 JsonFetcher = Callable[[str], Mapping[str, Any]]
 
 
@@ -180,7 +195,8 @@ def query_window_metrics(
   cpu_max = max(cpu_vals)
   mem_avg = sum(mem_vals) / len(mem_vals)
   mem_max = max(mem_vals)
-  return {
+  expected_points = int((padded_end - padded_start).total_seconds() // 60)
+  report = {
       "project": project,
       "instance_id": instance_id,
       "raw_window": {
@@ -192,6 +208,7 @@ def query_window_metrics(
           "end_utc": format_utc_timestamp(padded_end),
           "alignment_period": "60s",
           "per_series_aligner": "ALIGN_MEAN",
+          "expected_points": expected_points,
       },
       "cpu_utilization": {
           "metric": CPU_METRIC,
@@ -216,6 +233,15 @@ def query_window_metrics(
           ],
       },
   }
+  if len(cpu_points) < expected_points or len(mem_points) < expected_points:
+    raise IncompleteSeriesError(
+        f"incomplete series: cpu {len(cpu_points)}/{expected_points}, "
+        f"memory {len(mem_points)}/{expected_points} points in "
+        f"[{format_utc_timestamp(padded_start)}, "
+        f"{format_utc_timestamp(padded_end)}]",
+        report,
+    )
+  return report
 
 
 def fetch_metadata(path: str) -> str:
@@ -325,6 +351,15 @@ def main(argv: list[str] | None = None) -> int:
           fetcher, project, instance_id, start_dt, end_dt
       )
       break
+    except IncompleteSeriesError as err:
+      if time.monotonic() >= deadline:
+        # Keep the partial report: `analyze.py` marks series whose
+        # `point_count` is below `expected_points`, which is more useful than
+        # a missing cell.
+        print(f"monitoring: {err}; writing partial report", file=sys.stderr)
+        report = err.report
+        break
+      time.sleep(15)
     except MonitoringError as err:
       if time.monotonic() >= deadline:
         print(f"monitoring: {err}", file=sys.stderr)

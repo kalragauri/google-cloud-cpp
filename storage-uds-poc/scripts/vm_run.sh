@@ -38,6 +38,16 @@
 #   * Regional BidiReadObject is gated per bucket-owning project; any phase
 #     that reads bidi on the regional bucket first checks the gate and aborts
 #     with a clear message instead of producing 15 PERMISSION_DENIED cells.
+#     For `full` with ALLOW_REGIONAL_BIDI=1 the gate runs before the zonal
+#     cells, so a gate failure produces no cells at all (fix the allow list or
+#     drop ALLOW_REGIONAL_BIDI, then rerun).
+#
+# Environment: OPS (results bucket/prefix), PHASE, REGIONAL, ZONAL,
+# BUCKET_PREFIX, ALLOW_REGIONAL_BIDI, WORKER_THREADS, MONITORING_FLUSH_SECS
+# (seconds to wait after the last cell before querying Cloud Monitoring; GCE
+# publishes `instance/cpu/utilization` once a minute with up to ~240 s
+# visibility delay, and `monitoring.py` additionally retries while a window is
+# missing buckets), POC (checkout path), RUN (results directory name).
 set -uo pipefail
 
 OPS="${OPS:?OPS bucket must be set}"
@@ -47,30 +57,42 @@ ZONAL="${ZONAL:-}"
 BUCKET_PREFIX="${BUCKET_PREFIX:-}"
 ALLOW_REGIONAL_BIDI="${ALLOW_REGIONAL_BIDI:-0}"
 WORKER_THREADS="${WORKER_THREADS:-0}"
+MONITORING_FLUSH_SECS="${MONITORING_FLUSH_SECS:-240}"
 POC="${POC:-$HOME/poc/src/storage-uds-poc}"
 BUILD="$POC/cmake-out"
 RUN="${RUN:-$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}"
 OUT="$HOME/poc/results/$RUN"
 
+fatal() {
+  echo "FATAL: $*" >&2
+  exit 1
+}
+
+[[ "$WORKER_THREADS" =~ ^[0-9]+$ ]] ||
+  fatal "WORKER_THREADS must be a non-negative integer, got '$WORKER_THREADS'"
+[[ "$MONITORING_FLUSH_SECS" =~ ^[0-9]+$ ]] ||
+  fatal "MONITORING_FLUSH_SECS must be a non-negative integer, got" \
+    "'$MONITORING_FLUSH_SECS'"
+
 case "$PHASE" in
-  probes | smoke | full)
-    : "${REGIONAL:?REGIONAL bucket must be set}"
-    : "${ZONAL:?ZONAL bucket must be set}"
-    : "${BUCKET_PREFIX:?BUCKET_PREFIX must be set}"
+  probes)
+    [[ -n "$REGIONAL" && -n "$ZONAL" ]] ||
+      fatal "PHASE=probes requires REGIONAL and ZONAL"
+    ;;
+  smoke | full)
+    [[ -n "$REGIONAL" && -n "$ZONAL" && -n "$BUCKET_PREFIX" ]] ||
+      fatal "PHASE=$PHASE requires REGIONAL, ZONAL, and BUCKET_PREFIX"
     ;;
   regional)
-    : "${REGIONAL:?REGIONAL bucket must be set}"
+    [[ -n "$REGIONAL" ]] || fatal "PHASE=regional requires REGIONAL"
     ;;
   wt)
-    : "${ZONAL:?ZONAL bucket must be set}"
-    if (( WORKER_THREADS <= 0 )); then
-      echo "FATAL: PHASE=wt requires WORKER_THREADS > 0" >&2
-      exit 1
-    fi
+    [[ -n "$ZONAL" ]] || fatal "PHASE=wt requires ZONAL"
+    [[ "$WORKER_THREADS" =~ ^[1-9][0-9]*$ ]] ||
+      fatal "PHASE=wt requires WORKER_THREADS > 0, got '$WORKER_THREADS'"
     ;;
   *)
-    echo "FATAL: unknown PHASE=$PHASE" >&2
-    exit 1
+    fatal "unknown PHASE=$PHASE"
     ;;
 esac
 
@@ -82,10 +104,15 @@ BENCH="$BUILD/bench/uds_poc_bench"
 VERIFY="$POC/scripts/verify_path.py"
 MON="$POC/scripts/monitoring.py"
 
+# Uploads are best-effort: a transient GCS error must not abort the matrix,
+# and everything is re-uploaded from $OUT at the end of the run.
+upload() {
+  gcloud storage cp --quiet "$@" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+}
+
 # Row D3: verify Google Cloud Ops Agent is active before measuring.
 if ! systemctl is-active --quiet google-cloud-ops-agent; then
-  echo "FATAL: google-cloud-ops-agent is not active" >&2
-  exit 1
+  fatal "google-cloud-ops-agent is not active"
 fi
 
 md() {
@@ -102,12 +129,12 @@ CPP_SHA="$(git -C "$POC/.." rev-parse HEAD 2>/dev/null || echo unknown)"
 
 {
   echo "host=$(hostname) project=$PROJECT instance_id=$INSTANCE_ID zone=$ZONE machine=$MACHINE cpus=$(nproc)"
-  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX worker_threads=$WORKER_THREADS start=$(date -u +%FT%TZ)"
+  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX worker_threads=$WORKER_THREADS monitoring_flush_secs=$MONITORING_FLUSH_SECS start=$(date -u +%FT%TZ)"
   echo "ops_agent=$(systemctl is-active google-cloud-ops-agent)"
   echo "cpp_sha=$CPP_SHA rust_sha=$RUST_SHA"
   echo "kernel=$(uname -r) glibc=$(ldd --version | head -1 | awk '{print $NF}')"
 } | tee run-info.txt
-gcloud storage cp --quiet run-info.txt "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+upload run-info.txt
 
 stop_daemon() {
   pkill -x gcs-core-server 2>/dev/null || true
@@ -119,18 +146,26 @@ stop_daemon() {
 
 # Aborts unless the service admits BidiReadObject on the regional bucket. The
 # quickstart prints a "GAP  BidiReadObject" line when the bucket-owning project
-# is not on the allow list; everything else in that run still passes, so the
-# exit code alone cannot be used.
+# is not on the allow list and still exits 0, so the marker is what decides;
+# a non-zero exit means the gate itself could not run (credentials, bucket,
+# network) and is reported as such. Either way `run-info.txt` records the
+# outcome before the run stops.
 require_regional_bidi() {
   local gate_log="gate-quickstart-inproc-regional.log"
   stop_daemon
   "$BUILD/quickstart_inproc" --project="$PROJECT" "$REGIONAL" >"$gate_log" 2>&1
   local rc=$?
-  gcloud storage cp --quiet "$gate_log" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
-  if (( rc != 0 )) || [[ "$(cat "$gate_log")" == *"GAP  BidiReadObject"* ]]; then
-    echo "FATAL: BidiReadObject is not admitted on gs://$REGIONAL (rc=$rc);" \
-      "see $gate_log" >&2
-    exit 1
+  upload "$gate_log"
+  local verdict=""
+  if (( rc != 0 )); then
+    verdict="gate quickstart failed (exit $rc), see $gate_log"
+  elif [[ "$(cat "$gate_log")" == *"GAP  BidiReadObject"* ]]; then
+    verdict="BidiReadObject not admitted on gs://$REGIONAL (PERMISSION_DENIED), see $gate_log"
+  fi
+  if [[ -n "$verdict" ]]; then
+    echo "end=$(date -u +%FT%TZ) gate=FAILED failed_runs=0 reason=$verdict" | tee -a run-info.txt
+    upload run-info.txt
+    fatal "$verdict"
   fi
   echo "gate: BidiReadObject admitted on gs://$REGIONAL"
 }
@@ -163,7 +198,7 @@ if [[ "$PHASE" == "probes" ]]; then
     --start="$PROBE_START" --end="$PROBE_END" --wait-secs=240 \
     --out="probe-monitoring.json" || FAILED=$((FAILED + 1))
   echo "end=$(date -u +%FT%TZ) failed_runs=$FAILED" | tee -a run-info.txt
-  gcloud storage cp --quiet "$OUT"/* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  upload "$OUT"/*
   exit $((FAILED > 0 ? 1 : 0))
 fi
 
@@ -203,46 +238,42 @@ run_cell() {
   else
     SUMMARY_FILES+=("$name")
   fi
-  gcloud storage cp --quiet "$name".* "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+  upload "$name".*
 }
 
+# Comparators and workloads per phase. `wt` keeps only the two UDS comparators
+# (native has no Tokio pool) and the two workloads of the sensitivity check,
+# and goes through the same loop as the matrix so its flags cannot drift from
+# the base cells that `analyze.py --sensitivity` compares against. The
+# comparator order still rotates per workload (row C8).
 COMPS=(native uds-sidecar uds-inproc)
+SHORT_WORKLOADS=(open read50x2x4-serial read50x2x4-concurrent random8k)
+BIDI_TARGETS=()
+case "$PHASE" in
+  wt)
+    COMPS=(uds-sidecar uds-inproc)
+    SHORT_WORKLOADS=(random8k)
+    BIDI_TARGETS=("zonal:$ZONAL")
+    ;;
+  regional)
+    require_regional_bidi
+    BIDI_TARGETS=("regional:$REGIONAL")
+    ;;
+  *)
+    BIDI_TARGETS=("zonal:$ZONAL")
+    if [[ "$ALLOW_REGIONAL_BIDI" == "1" ]]; then
+      require_regional_bidi
+      BIDI_TARGETS+=("regional:$REGIONAL")
+    fi
+    ;;
+esac
 k=0
 
-# --- PHASE=wt: worker-thread sensitivity on the UDS comparators only ---------
-# Native has no Tokio pool, so it is not a comparator here; the base run (same
-# cells at the default WORKER_THREADS=0) is the reference for
-# `analyze.py --sensitivity`.
-if [[ "$PHASE" == "wt" ]]; then
-  for mode in uds-sidecar uds-inproc; do
-    run_cell "random8k-zonal" "$mode" \
-      --workload=random8k --bucket="$ZONAL" --bucket-type=zonal \
-      --duration-secs="$DUR_SHORT"
-  done
-  for mode in uds-sidecar uds-inproc; do
-    run_cell "bidi-read-48t-zonal" "$mode" \
-      --workload=bidi-read-48t --bucket="$ZONAL" --bucket-type=zonal \
-      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
-  done
-fi
-
-# --- W1-W3 on zonal (and regional when allow-listed) --------------------------
-BIDI_TARGETS=()
-if [[ "$PHASE" == "regional" ]]; then
-  require_regional_bidi
-  BIDI_TARGETS=("regional:$REGIONAL")
-elif [[ "$PHASE" != "wt" ]]; then
-  BIDI_TARGETS=("zonal:$ZONAL")
-  if [[ "$ALLOW_REGIONAL_BIDI" == "1" ]]; then
-    require_regional_bidi
-    BIDI_TARGETS+=("regional:$REGIONAL")
-  fi
-fi
-
+# --- W1-W4 per bucket target ---------------------------------------------------
 for target in "${BIDI_TARGETS[@]}"; do
   btype="${target%%:*}"
   bname="${target#*:}"
-  for w in open read50x2x4-serial read50x2x4-concurrent random8k; do
+  for w in "${SHORT_WORKLOADS[@]}"; do
     for mode in $(rotate "$k" "${COMPS[@]}"); do
       run_cell "${w}-${btype}" "$mode" \
         --workload="$w" --bucket="$bname" --bucket-type="$btype" \
@@ -251,7 +282,7 @@ for target in "${BIDI_TARGETS[@]}"; do
     k=$((k + 1))
   done
 
-  # --- W4: 48-thread BidiRead 16 MiB ranges of 200 MiB object -----------------
+  # --- W4: 48-thread BidiRead, 16 MiB ranges (last 8 MiB) of a 200 MiB object -
   for mode in $(rotate "$k" "${COMPS[@]}"); do
     run_cell "bidi-read-48t-${btype}" "$mode" \
       --workload=bidi-read-48t --bucket="$bname" --bucket-type="$btype" \
@@ -286,9 +317,12 @@ if [[ "$PHASE" == "smoke" || "$PHASE" == "full" ]]; then
 fi
 
 # --- Query Cloud Monitoring CPU & Ops Agent memory per cell window ------------
-# Wait for the final cell's 60 s Monitoring alignment bucket to close and flush
-# (`compute.googleapis.com/instance/cpu/utilization` has up to ~240 s lag).
-sleep "${MONITORING_FLUSH_SECS:-240}"
+# Wait for the final cell's 60 s alignment bucket to become visible before the
+# first query; `monitoring.py` then keeps retrying any window that is still
+# missing buckets until its own `--wait-secs` deadline.
+if (( ${#SUMMARY_FILES[@]} > 0 )); then
+  sleep "$MONITORING_FLUSH_SECS"
+fi
 echo "######## Querying Cloud Monitoring for ${#SUMMARY_FILES[@]} windows"
 for name in "${SUMMARY_FILES[@]}"; do
   if ! python3 "$MON" \
@@ -300,11 +334,11 @@ for name in "${SUMMARY_FILES[@]}"; do
     echo "  monitoring FAILED for $name" >&2
     FAILED=$((FAILED + 1))
   else
-    gcloud storage cp --quiet "$name.monitoring.json" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+    upload "$name.monitoring.json"
   fi
 done
 
 echo "end=$(date -u +%FT%TZ) failed_runs=$FAILED" | tee -a run-info.txt
-gcloud storage cp --quiet run-info.txt "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
+upload run-info.txt
 echo "RUN=$RUN FAILED_RUNS=$FAILED"
 exit $((FAILED > 0 ? 1 : 0))

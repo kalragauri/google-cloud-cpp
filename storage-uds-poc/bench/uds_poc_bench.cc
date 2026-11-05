@@ -1000,10 +1000,16 @@ bool ParseFlags(int argc, char* argv[], Config& cfg) {
 }  // namespace
 
 int main(int argc, char* argv[]) {
-  // gRPC's `DefaultEventEngine` worker threads outlive `main()` and tear down
-  // cancelled TLS handshakes asynchronously; disabling OpenSSL 3's `atexit`
-  // handler prevents `OPENSSL_cleanup()` from racing their thread-exit TLS
-  // destructors (`ossl_cleanup_thread`).
+  // gRPC's event-engine worker threads outlive `main()`. With OpenSSL 3
+  // statically linked, libc's `atexit` runs `OPENSSL_cleanup()`, whose
+  // `ossl_cleanup_thread()` frees every thread's OpenSSL thread-local handles
+  // without locking, while an exiting worker's own key destructor frees the
+  // same handles: a double free at exit ("double free or corruption
+  // (fasttop)"). Asking OpenSSL not to register that handler removes the race.
+  // This only works if this is the first OpenSSL initialization in the process
+  // (the registration choice is a one-time decision); nothing in this binary's
+  // link closure initializes OpenSSL before `main`, which was verified by
+  // inspection, not by a runtime check.
   (void)OPENSSL_init_crypto(OPENSSL_INIT_NO_ATEXIT, nullptr);
 
   Config cfg;

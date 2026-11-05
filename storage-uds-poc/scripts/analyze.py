@@ -27,18 +27,22 @@ renders side-by-side comparison tables across `native`, `uds-sidecar`, and
 
 `--doc-tables` renders one table per workload and bucket type in the layout of
 the consolidation worklog ("Benchmarking Results"): Native | uds-sidecar |
-% Diff | uds-inproc | % Diff for latency (P50 / P90 / P99), throughput (MB/s,
-or ops/s for metadata-only workloads), Cloud Monitoring CPU and peak memory.
-W4 (`bidi-read-48t`) reports the per-16 MiB-range latency there, which is the
-quantity the other language columns report; the per-object latency stays in
-the primary table.
+% Diff | uds-inproc | % Diff for latency (P50 / P90 / P99), throughput (MB/s
+for the bulk-data workloads, ops/s for the rate-bound ones), Cloud Monitoring
+CPU and peak memory. The latency basis is decided once per cell and named in
+the row label: W4 (`bidi-read-48t`) reports the per-range latency (13 ranges
+per 200 MiB object: twelve of 16 MiB and a final 8 MiB range), which is the
+quantity the other language columns report; every other workload reports
+per-operation latency, and the primary table keeps per-object latency for W4.
+Monitoring values whose window is missing 60 s buckets are marked with `‡`.
 
 `--sensitivity BASE_DIR` compares the UDS comparators of `WT_RESULTS_DIR` (a
 `--worker-threads=N` run) against the same cells in `BASE_DIR` (default worker
-threads).
+threads). The two modes are mutually exclusive.
 """
 
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -65,11 +69,22 @@ WORKLOAD_TITLES = (
     ("list-buckets-100", "W6b — ListBuckets, 100 items, project-scoped"),
 )
 
+# Throughput unit per workload. Bulk-data workloads are bandwidth-bound and
+# report MB/s; the others move < 1 MiB per operation and report ops/s. Keyed by
+# workload so every comparator in a cell uses the same unit regardless of what
+# it managed to move.
+BULK_DATA_WORKLOADS = frozenset(
+    {"read50x2x4-serial", "read50x2x4-concurrent", "bidi-read-48t",
+     "bidi-write-48t"})
+
+# Bucket locations are not in the summary JSON; the report states them.
 BUCKET_LABELS = {
-    "zonal": "Zonal (`us-west1-a`, RAPID)",
-    "regional": "Standard Regional (`us-west1`)",
+    "zonal": "Zonal (RAPID)",
+    "regional": "Standard Regional",
     "project": "Project-scoped",
 }
+
+MONITORING_INCOMPLETE_MARK = "‡"
 
 
 def load_json_if_exists(path: str) -> Mapping[str, Any] | None:
@@ -284,67 +299,101 @@ def pct_diff(value: float, base: float) -> str:
   return f"{(value - base) / base * 100.0:+.1f}%"
 
 
-def doc_latency(summary: Mapping[str, Any]) -> Mapping[str, Any]:
-  """Latency distribution to report in the worklog table.
+def has_range_latency(summary: Mapping[str, Any]) -> bool:
+  return (summary.get("workload") == "bidi-read-48t" and
+          int(summary.get("range_latency_us", {}).get("count", 0)) > 0)
 
-  W4 streams a 200 MiB object as 16 MiB ranges; the other language columns
-  report the per-range latency, so the per-range distribution is used when
-  present. Every other workload reports its per-operation latency.
+
+def latency_basis(entries: Sequence[Mapping[str, Any]]) -> str:
+  """Decides, once per cell, which latency distribution a table row reports.
+
+  W4 streams each 200 MiB object as 13 ranges (twelve of 16 MiB, one of 8 MiB);
+  the other language columns report the per-range latency, so W4 uses it when
+  *every* comparator in the cell recorded ranges. Mixing a per-range value for
+  one comparator with a per-object value for another would make the `% Diff`
+  meaningless, so a cell where any comparator lacks ranges falls back to
+  per-operation latency for all of them.
   """
-  rlat = summary.get("range_latency_us", {})
-  if (summary.get("workload") == "bidi-read-48t" and
-      int(rlat.get("count", 0)) > 0):
-    return rlat
+  if entries and all(has_range_latency(e["summary"]) for e in entries):
+    return "per range"
+  return "per op"
+
+
+def doc_latency(summary: Mapping[str, Any], basis: str) -> Mapping[str, Any]:
+  if basis == "per range":
+    return summary["range_latency_us"]
   return summary["latency_us"]
 
 
 def doc_throughput(summary: Mapping[str, Any]) -> tuple[float, str]:
-  """Returns `(value, label)`: MB/s for bulk-data workloads, ops/s otherwise.
+  """Returns `(value, unit)`: MB/s for bulk-data workloads, ops/s otherwise.
 
-  Operations that move less than 1 MiB each (`open`, the 8 KiB random reads,
-  and the listings) are rate-bound, not bandwidth-bound, so ops/s is the
-  figure the worklog asks for ("MB/s or operations per second").
+  The unit is a property of the workload (`BULK_DATA_WORKLOADS`), not of what
+  a comparator happened to move, so a failed or empty cell cannot flip a row
+  from MB/s to ops/s.
   """
   wall = float(summary["window_wall_secs"])
-  ops_ok = int(summary["ops_ok"])
-  bytes_per_op = int(summary["total_bytes"]) / max(ops_ok, 1)
-  if bytes_per_op >= 1024 * 1024:
+  if summary.get("workload") in BULK_DATA_WORKLOADS:
     return float(summary["throughput_mb_s"]), "MB/s"
-  ops = float(ops_ok) / wall if wall > 0.0 else 0.0
+  ops = float(summary["ops_ok"]) / wall if wall > 0.0 else 0.0
   return ops, "ops/s"
 
 
-def monitoring_value(mon: Mapping[str, Any] | None, series: str,
-                     field: str) -> float | None:
-  if not mon:
+def monitoring_expected_points(mon: Mapping[str, Any]) -> int | None:
+  """Number of 60 s buckets the aligned window should contain, or None."""
+  window = mon.get("aligned_window") or {}
+  try:
+    start = datetime.datetime.fromisoformat(
+        str(window["start_utc"]).replace("Z", "+00:00"))
+    end = datetime.datetime.fromisoformat(
+        str(window["end_utc"]).replace("Z", "+00:00"))
+  except (KeyError, ValueError):
     return None
-  return float(mon[series][field])
+  return max(0, int((end - start).total_seconds() // 60))
 
 
-def doc_metric_rows(
-    entry: Mapping[str, Any]) -> list[tuple[str, str, float | None, bool]]:
-  """Rows `(metric, display, numeric value for % diff, lower is better)`."""
+def monitoring_value(mon: Mapping[str, Any] | None, series: str,
+                     field: str) -> tuple[float | None, bool]:
+  """Returns `(value, complete)`; `complete` is False when the series has fewer
+  points than the aligned window has 60 s buckets (a late Monitoring flush)."""
+  if not mon or series not in mon:
+    return None, True
+  expected = monitoring_expected_points(mon)
+  count = int(mon[series].get("point_count", 0))
+  complete = expected is None or count >= expected
+  return float(mon[series][field]), complete
+
+
+def percent_display(value: float | None, complete: bool) -> str:
+  if value is None:
+    return "n/a"
+  return f"{value:.2f}%" + ("" if complete else MONITORING_INCOMPLETE_MARK)
+
+
+def doc_metric_rows(entry: Mapping[str, Any],
+                    basis: str) -> list[tuple[str, str, float | None]]:
+  """Rows `(metric, display, numeric value for % diff)` for one comparator."""
   s = entry["summary"]
-  lat = doc_latency(s)
+  lat = doc_latency(s, basis)
   tput, unit = doc_throughput(s)
-  cpu = monitoring_value(entry["monitoring"], "cpu_utilization", "avg_percent")
-  mem = monitoring_value(entry["monitoring"], "memory_percent_used",
-                         "max_percent")
-  rows: list[tuple[str, str, float | None, bool]] = []
+  cpu, cpu_ok = monitoring_value(entry["monitoring"], "cpu_utilization",
+                                 "avg_percent")
+  mem, mem_ok = monitoring_value(entry["monitoring"], "memory_percent_used",
+                                 "max_percent")
+  rows: list[tuple[str, str, float | None]] = []
   for pct in ("p50", "p90", "p99"):
-    rows.append((f"Latency {pct.upper()}", format_latency(float(lat[pct])),
-                 float(lat[pct]), True))
+    rows.append((f"Latency {pct.upper()} ({basis})",
+                 format_latency(float(lat[pct])), float(lat[pct])))
   if unit == "MB/s":
     tput_display = f"{tput:,.1f} {unit}"
   else:
     tput_display = f"{tput:,.2f} {unit}"
-  rows.append(("Throughput", tput_display, tput, False))
+  rows.append(("Throughput", tput_display, tput))
   rows.append(("CPU Utilization (`instance/cpu/utilization`, avg)",
-               "n/a" if cpu is None else f"{cpu:.2f}%", cpu, True))
+               percent_display(cpu, cpu_ok), cpu))
   rows.append(("Peak Memory (`memory/percent_used`, max)",
-               "n/a" if mem is None else f"{mem:.2f}%", mem, True))
-  rows.append(("Ops (ok / err)", f"{s['ops_ok']} / {s['ops_err']}", None,
-               False))
+               percent_display(mem, mem_ok), mem))
+  rows.append(("Ops (ok / err)", f"{s['ops_ok']} / {s['ops_err']}", None))
   return rows
 
 
@@ -359,34 +408,41 @@ def render_doc_tables(
   lines.append(
       "`% Diff` is `(UDS - Native) / Native`; negative latency, CPU, and "
       "memory deltas and positive throughput deltas favor the UDS comparator. "
-      "W4 latency is per 16 MiB range.")
+      "Latency rows name their basis: `per op` is one benchmark operation; "
+      "`per range` (W4) is one `ObjectDescriptor::Read` range, 13 per 200 MiB "
+      "object (twelve of 16 MiB and a final 8 MiB range). "
+      f"`{MONITORING_INCOMPLETE_MARK}` marks a Monitoring series with fewer "
+      "points than the window has 60 s buckets.")
   for cell_name in sorted(cells, key=workload_order):
     by_mode = cells[cell_name]
-    if "native" not in by_mode:
-      continue
     workload, bucket_type = split_cell_name(cell_name)
     lines.append("")
     lines.append(f"### {workload_title(workload)}")
     lines.append("")
+    bucket = str(by_mode[next(iter(by_mode))]["summary"].get("bucket", ""))
+    bucket_note = f" `gs://{bucket}`" if bucket else ""
     lines.append(
-        f"Bucket: {BUCKET_LABELS.get(bucket_type, bucket_type)} · cell "
-        f"`{cell_name}`")
+        f"Bucket: {BUCKET_LABELS.get(bucket_type, bucket_type)}{bucket_note} "
+        f"· cell `{cell_name}`")
     lines.append("")
+    if "native" not in by_mode:
+      lines.append("(no native cell in this results directory; skipped)")
+      continue
+    present_uds = [m for m in UDS_MODES if m in by_mode]
+    basis = latency_basis([by_mode[m] for m in ["native", *present_uds]])
     header = "| Metric | Native C++ |"
     sep = "|---|---:|"
-    present_uds = [m for m in UDS_MODES if m in by_mode]
     for mode in present_uds:
       header += f" `{mode}` | % Diff |"
       sep += "---:|---:|"
     lines.append(header)
     lines.append(sep)
-    native_rows = doc_metric_rows(by_mode["native"])
-    uds_rows = {m: doc_metric_rows(by_mode[m]) for m in present_uds}
-    for idx, (metric, native_display, native_value,
-              _) in enumerate(native_rows):
+    native_rows = doc_metric_rows(by_mode["native"], basis)
+    uds_rows = {m: doc_metric_rows(by_mode[m], basis) for m in present_uds}
+    for idx, (metric, native_display, native_value) in enumerate(native_rows):
       row = f"| {metric} | {native_display} |"
       for mode in present_uds:
-        _, display, value, _ = uds_rows[mode][idx]
+        _, display, value = uds_rows[mode][idx]
         diff = ("" if native_value is None or value is None else
                 pct_diff(value, native_value))
         row += f" {display} | {diff} |"
@@ -406,6 +462,12 @@ def render_sensitivity(
   lines.append(f"# Worker-thread sensitivity (`{wt_name}` vs `{base_name}`)")
   lines.append("")
   lines.append(
+      "`% Diff` is `(worker-thread run - base) / base`. Latency rows name "
+      "their basis (`per op`, or `per range` for W4: 13 ranges per 200 MiB "
+      f"object, the last one 8 MiB). `{MONITORING_INCOMPLETE_MARK}` marks an "
+      "incomplete Monitoring series.")
+  lines.append("")
+  lines.append(
       "| Cell | Comparator | Metric | Base | Worker-thread run | % Diff |")
   lines.append("|---|---|---|---:|---:|---:|")
   for cell_name in sorted(wt_cells, key=workload_order):
@@ -417,10 +479,12 @@ def render_sensitivity(
         continue
       base_entry = base_cells[cell_name][mode]
       wt_entry = wt_cells[cell_name][mode]
-      base_rows = doc_metric_rows(base_entry)
-      wt_rows = doc_metric_rows(wt_entry)
-      for (metric, base_display, base_value, _), (_, wt_display, wt_value,
-                                                  _) in zip(base_rows, wt_rows):
+      basis = latency_basis([base_entry, wt_entry])
+      base_rows = doc_metric_rows(base_entry, basis)
+      wt_rows = doc_metric_rows(wt_entry, basis)
+      for (metric, base_display, base_value), (_, wt_display,
+                                               wt_value) in zip(base_rows,
+                                                                wt_rows):
         diff = ("" if base_value is None or wt_value is None else
                 pct_diff(wt_value, base_value))
         lines.append(f"| `{cell_name}` | `{mode}` | {metric} | "
@@ -442,12 +506,15 @@ def main(argv: Sequence[str] | None = None) -> int:
   parser = argparse.ArgumentParser(
       description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   parser.add_argument("results_dir")
-  parser.add_argument("--doc-tables", action="store_true",
-                      help="render the worklog 'Benchmarking Results' layout")
-  parser.add_argument("--sensitivity", metavar="BASE_DIR",
-                      help="compare UDS comparators of RESULTS_DIR against "
-                      "the same cells in BASE_DIR")
+  modes = parser.add_mutually_exclusive_group()
+  modes.add_argument("--doc-tables", action="store_true",
+                     help="render the worklog 'Benchmarking Results' layout")
+  modes.add_argument("--sensitivity", metavar="BASE_DIR",
+                     help="compare UDS comparators of RESULTS_DIR against "
+                     "the same cells in BASE_DIR")
   args = parser.parse_args(argv)
+  if args.sensitivity is not None and not args.sensitivity:
+    parser.error("--sensitivity requires a non-empty BASE_DIR")
 
   cells = discover_cells(args.results_dir)
   if not cells:

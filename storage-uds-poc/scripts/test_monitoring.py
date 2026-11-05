@@ -178,10 +178,11 @@ class MonitoringTest(unittest.TestCase):
   def test_query_window_metrics_aggregates_cpu_and_memory(self) -> None:
     # Pins rows D1 and D2: instance_id + state="used" filters, 60s ALIGN_MEAN,
     # pagination across nextPageToken, chronological ordering, CPU avg/max, and
-    # peak memory percent.
+    # peak memory percent. The window ends on a minute boundary so the three
+    # recorded points (12:02, 12:03, 12:04) fill the padded window exactly.
     backend = FakeMonitoringBackend()
     start = monitoring.parse_utc_timestamp("2026-11-04T12:01:12Z")
-    end = monitoring.parse_utc_timestamp("2026-11-04T12:04:49Z")
+    end = monitoring.parse_utc_timestamp("2026-11-04T12:04:00Z")
 
     report = monitoring.query_window_metrics(
         backend,
@@ -196,7 +197,7 @@ class MonitoringTest(unittest.TestCase):
     self.assertEqual(first_qs["aggregation.alignmentPeriod"], ["60s"])
     self.assertEqual(first_qs["aggregation.perSeriesAligner"], ["ALIGN_MEAN"])
     self.assertEqual(first_qs["interval.startTime"], ["2026-11-04T12:01:00Z"])
-    self.assertEqual(first_qs["interval.endTime"], ["2026-11-04T12:05:00Z"])
+    self.assertEqual(first_qs["interval.endTime"], ["2026-11-04T12:04:00Z"])
     self.assertIn(
         'resource.labels.instance_id = "987654321012345678"',
         first_qs["filter"][0],
@@ -205,6 +206,7 @@ class MonitoringTest(unittest.TestCase):
     mem_qs = urllib.parse.parse_qs(urllib.parse.urlparse(backend.urls[2]).query)
     self.assertIn('metric.labels.state = "used"', mem_qs["filter"][0])
 
+    self.assertEqual(report["aligned_window"]["expected_points"], 3)
     cpu = report["cpu_utilization"]
     self.assertEqual(cpu["point_count"], 3)
     self.assertAlmostEqual(cpu["avg_fraction"], 0.30, places=6)
@@ -225,6 +227,28 @@ class MonitoringTest(unittest.TestCase):
     self.assertAlmostEqual(mem["max_percent"], 7.5, places=6)
     self.assertAlmostEqual(mem["avg_percent"], 6.5, places=6)
 
+  def test_incomplete_series_raises_with_partial_report(self) -> None:
+    # A window that pads to 12:05 expects 4 buckets, but the recorded series
+    # stops at 12:04 (the late-flush case): the query must signal the shortfall
+    # so the CLI keeps polling, and carry the partial report for the deadline
+    # fallback.
+    backend = FakeMonitoringBackend()
+    start = monitoring.parse_utc_timestamp("2026-11-04T12:01:12Z")
+    end = monitoring.parse_utc_timestamp("2026-11-04T12:04:49Z")
+    with self.assertRaisesRegex(monitoring.IncompleteSeriesError,
+                                "cpu 3/4, memory 3/4") as ctx:
+      monitoring.query_window_metrics(
+          backend,
+          project="kalragauri-sdk-test",
+          instance_id="987654321012345678",
+          start=start,
+          end=end,
+      )
+    partial = ctx.exception.report
+    self.assertEqual(partial["aligned_window"]["expected_points"], 4)
+    self.assertEqual(partial["cpu_utilization"]["point_count"], 3)
+    self.assertIsInstance(ctx.exception, monitoring.MonitoringError)
+
   def test_empty_series_raises_instead_of_reporting_zero(self) -> None:
     # Missing Ops Agent or ingestion lag must fail loudly rather than writing a
     # misleading 0% memory figure.
@@ -242,7 +266,10 @@ class MonitoringTest(unittest.TestCase):
 
   def test_cli_reads_summary_json_and_writes_output_file(self) -> None:
     # End-to-end CLI flow reading window_start_utc/window_end_utc from a bench
-    # summary file in a real temporary directory.
+    # summary file in a real temporary directory. The recorded series is one
+    # bucket short of this window and `--wait-secs` defaults to 0, so the CLI
+    # must write the partial report (marked by `expected_points`) rather than
+    # fail the cell.
     backend = FakeMonitoringBackend()
     with tempfile.TemporaryDirectory() as tmpdir:
       summary_path = os.path.join(tmpdir, "cell.summary.json")
@@ -271,6 +298,8 @@ class MonitoringTest(unittest.TestCase):
       self.assertEqual(rc, 0)
       with open(out_path, "r", encoding="utf-8") as fh:
         written = json.load(fh)
+      self.assertEqual(written["aligned_window"]["expected_points"], 4)
+      self.assertEqual(written["cpu_utilization"]["point_count"], 3)
       self.assertAlmostEqual(
           written["cpu_utilization"]["max_percent"], 42.0, places=4
       )

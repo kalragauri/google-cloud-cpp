@@ -29,11 +29,14 @@
 ## Where the server comes from
 
 CMake fetches `google-cloud-rust` (`GCS_CORE_RUST_REPO`, default the
-`kalragauri` fork) at `GCS_CORE_RUST_REF` (branch `grpc-uds-cpp` or pinned
-commit SHA: `googleapis/google-cloud-rust` PR #7350 plus our five follow-up
-commits) and builds `storage-grpc-uds` with `cargo`. Nothing from the server is
-copied into this tree. For local iteration on the server, point CMake at a
-worktree:
+`kalragauri` fork) at `GCS_CORE_RUST_REF`, pinned to the commit SHA of branch
+`grpc-uds-cpp` (`googleapis/google-cloud-rust` PR #7350 plus our five follow-up
+commits), and builds `storage-grpc-uds` with `cargo`. The pin is a CMake cache
+default: an existing build directory keeps whatever it was configured with, and
+`-DFETCHCONTENT_SOURCE_DIR_GOOGLE_CLOUD_RUST=...` bypasses it entirely, so the
+benchmark runner records the server's actual `rust_sha` in `run-info.txt`.
+Nothing from the server is copied into this tree. For local iteration on the
+server, point CMake at a worktree:
 `-DFETCHCONTENT_SOURCE_DIR_GOOGLE_CLOUD_RUST=$HOME/google-cloud-rust-grpc-uds-cpp`.
 
 ## Layout
@@ -44,8 +47,8 @@ worktree:
 | `cpp/include/gcs_core/client.h`, `cpp/src/` | Thin `gcscore.v1.GcsCore` gRPC wrapper + `StorageConnection` / `AsyncConnection` adapters; `core_backend.h` is the seam between `sidecar_backend.cc` and `inproc_backend.cc` |
 | `cpp/tests/` | `adapter_fake_test.cc` (33 public-SDK adapter tests against fake `GcsCore`), `client_fake_test.cc`, `client_common_test.cc`, `client_sidecar_test.cc`, `client_inproc_test.cc`, `sidecar_process_test.cc` |
 | `cpp/examples/quickstart.cc`, `cold_start.cc` | Live E2E check via public `Client` / `AsyncClient`; cold `Client::Create()` probe |
-| `bench/uds_poc_bench.cc` | Unified benchmark binary driving `--mode={native,uds-sidecar,uds-inproc}` across the 6 POC workloads (`open`, `read50x2x4-serial`, `read50x2x4-concurrent`, `random8k`, `bidi-read-48t`, `bidi-write-48t`, `list-objects-100`, `list-buckets-100`) |
-| `scripts/` | VM provisioning (`vm_startup.sh`, `vm_build.sh`), benchmark runner (`vm_run.sh`), path gate (`verify_path.py`), Cloud Monitoring collector (`monitoring.py`), packaging/deployment probes (`probe_inproc.sh`, `test_parent_crash.sh`, `test_peer_cred.sh`), and analyzer (`analyze.py`) |
+| `bench/uds_poc_bench.cc` | Unified benchmark binary driving `--mode={native,uds-sidecar,uds-inproc}` across the 8 POC workload variants (`open`, `read50x2x4-serial`, `read50x2x4-concurrent`, `random8k`, `bidi-read-48t`, `bidi-write-48t`, `list-objects-100`, `list-buckets-100`) |
+| `scripts/` | VM provisioning (`vm_startup.sh`, `vm_build.sh`), benchmark runner (`vm_run.sh`, control-flow test `test_vm_run.sh`), path gate (`verify_path.py`), Cloud Monitoring collector (`monitoring.py`), packaging/deployment probes (`probe_inproc.sh`, `test_parent_crash.sh`, `test_peer_cred.sh`), and analyzer (`analyze.py`) |
 
 ## Build and test (workstation)
 
@@ -69,21 +72,31 @@ ctest --test-dir cmake-out --output-on-failure
 
 The runner executes one comparator at a time, gates every cell on Cloudpath
 (`verify_path.py`), and queries Cloud Monitoring per cell window
-(`monitoring.py`). `PHASE` selects the matrix:
+(`monitoring.py`). `OPS` (results bucket and prefix) is required by every
+phase; `PHASE` selects the matrix:
 
 | `PHASE` | Cells | Required variables |
 | --- | --- | --- |
-| `probes` | `quickstart` / `quickstart_inproc` on both buckets + a Monitoring sanity query | `REGIONAL`, `ZONAL`, `BUCKET_PREFIX` |
-| `smoke` | every workload × comparator at second-long durations | same |
-| `full` | W1–W4 on zonal (plus regional when `ALLOW_REGIONAL_BIDI=1`), W5 on zonal, W6; 3 min / 5 min | same |
+| `probes` | `quickstart` / `quickstart_inproc` on both buckets + a Monitoring sanity query | `REGIONAL`, `ZONAL` |
+| `smoke` | every workload × comparator at second-long durations | `REGIONAL`, `ZONAL`, `BUCKET_PREFIX` |
+| `full` | W1–W4 on zonal (plus regional when `ALLOW_REGIONAL_BIDI=1`), W5 on zonal, W6; 3 min / 5 min | same as `smoke` |
 | `regional` | W1–W4 on the regional bucket only | `REGIONAL` |
-| `wt` | W3 and W4 on zonal for the two UDS comparators at `WORKER_THREADS=N` (`N > 0`) | `ZONAL`, `WORKER_THREADS` |
+| `wt` | W3 and W4 on zonal for the two UDS comparators at `WORKER_THREADS=N` (`N > 0`), through the same loop and flags as `full` | `ZONAL`, `WORKER_THREADS` |
 
-Regional `BidiReadObject` is admitted per bucket-owning project
-(preview allow list); `regional`, and `full` with
-`ALLOW_REGIONAL_BIDI=1`, run the `quickstart_inproc` gate first and abort if the
-service answers `PERMISSION_DENIED`. Summaries render with
-`scripts/analyze.py RESULTS_DIR [--doc-tables | --sensitivity BASE_DIR]`.
+Optional: `WORKER_THREADS` (default `0` = one Tokio worker per vCPU),
+`MONITORING_FLUSH_SECS` (default `240`, the wait after the last cell before the
+first Cloud Monitoring query; `monitoring.py` keeps retrying a window that is
+still missing 60 s buckets and marks a partial result with `expected_points`),
+`RUN` (results directory name), `POC` (checkout path).
+
+Regional `BidiReadObject` is admitted per bucket-owning project (preview
+allow list). `regional`, and `full` with
+`ALLOW_REGIONAL_BIDI=1`, first run `quickstart_inproc` against the regional
+bucket and abort — before any cell, recording `gate=FAILED` in `run-info.txt` —
+when it reports the `GAP  BidiReadObject` marker (the service answered
+`PERMISSION_DENIED`) or when the quickstart itself fails. Summaries render with
+`scripts/analyze.py RESULTS_DIR [--doc-tables | --sensitivity BASE_DIR]`; the
+runner's control flow is covered by `scripts/test_vm_run.sh` (stubbed, offline).
 
 ## Operational notes
 
