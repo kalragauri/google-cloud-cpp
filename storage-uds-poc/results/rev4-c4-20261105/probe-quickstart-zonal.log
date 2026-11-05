@@ -1,0 +1,18 @@
+server pid=85607
+appendable upload via AsyncClient::StartAppendableObjectUpload (gRPC BidiWriteObject)
+  ok   StartAppendableObjectUpload: 
+  ok   AsyncWriter::Write: 
+  ok   AsyncWriter::Flush: 
+  ok   AsyncWriter::Finalize: 
+  ok   x-uds-transport-used == GRPC
+bidi read via AsyncClient::Open (gRPC BidiReadObject)
+  ok   AsyncClient::Open: 
+  ok   full read via ObjectDescriptor::ReadFromOffset: 
+  ok   ranged read via ObjectDescriptor::Read: 
+regular JSON upload is rejected on a zonal bucket
+  ok   InsertObject on zonal fails (the service reports an error with code UNKNOWN described as: This bucket requires appendable objects.)
+list + delete (gRPC)
+  ok   ListObjects finds zonal object
+  ok   AsyncClient::DeleteObject: 
+PASS
+verify_path: 8 Cloudpath peers, 0 DirectPath

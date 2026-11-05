@@ -1,0 +1,176 @@
++ export OPS=kalragauri-uds-poc-ops/c4
++ OPS=kalragauri-uds-poc-ops/c4
++ export PHASE=probes
++ PHASE=probes
++ export RUN=probes
++ RUN=probes
++ export REGIONAL=kalragauri-uds-poc-usw1
++ REGIONAL=kalragauri-uds-poc-usw1
++ export ZONAL=kalragauri-uds-poc-usw1-zonal
++ ZONAL=kalragauri-uds-poc-usw1-zonal
++ export BUCKET_PREFIX=kalragauri-uds-list-
++ BUCKET_PREFIX=kalragauri-uds-list-
++ bash /home/poc/poc/src/storage-uds-poc/scripts/vm_run.sh
+host=kalragauri-uds-poc-c4 project=kalragauri-sdk-test instance_id=2425645790610435742 zone=us-central1-b machine=c4-standard-192 cpus=192
+phase=probes regional=kalragauri-uds-poc-usw1 zonal=kalragauri-uds-poc-usw1-zonal bucket_prefix=kalragauri-uds-list- worker_threads=0 start=2026-11-05T05:26:47Z
+ops_agent=active
+cpp_sha=unknown rust_sha=unknown
+/usr/bin/ldd: line 41: printf: write error: Broken pipe
+/usr/bin/ldd: line 43: printf: write error: Broken pipe
+kernel=7.0.0-1014-gcp glibc=2.39
+server pid=85607
+single-shot upload via storage::Client::InsertObject (JSON)
+  ok   InsertObject: 
+  ok   uploaded size matches
+resumable upload via storage::Client::WriteObject (JSON)
+  ok   WriteObject Close: 
+full read via storage::Client::ReadObject (JSON)
+  ok   ReadObject: 
+  ok   read back == written
+  ok   headers carry x-goog-hash crc32c
+ranged read via storage::Client::ReadObject (JSON)
+  ok   segment [1000, 5096): 
+list objects via storage::Client::ListObjects (gRPC)
+  ok   ListObjects finds both objects: 
+list buckets via storage::Client::ListBucketsForProject (gRPC)
+  ok   ListBucketsForProject: 
+bidi read via storage::AsyncClient::Open (gRPC)
+  GAP  BidiReadObject not enabled for this bucket: the service reports an error with code PERMISSION_DENIED described as: The BidiReadObject RPC is not yet available for general use, or for p
+errors
+  ok   missing object -> NOT_FOUND (the HTTP transport reports a [404] error: No such object: kalragauri-uds-poc-usw1/gcs-uds-poc/quickstart/1793856413338895831/regional.bin.does-not-exist)
+  ok   ifGenerationMatch=0 on existing -> FAILED_PRECONDITION (the service reports an error with code UNKNOWN described as: At least one of the pre-conditions you specified did not hold.)
+delete via storage::Client::DeleteObject (gRPC)
+  ok   DeleteObject
+  ok   DeleteObject resumable
+PASS
+verify_path: 8 Cloudpath peers, 0 DirectPath
+server pid=85607
+appendable upload via AsyncClient::StartAppendableObjectUpload (gRPC BidiWriteObject)
+  ok   StartAppendableObjectUpload: 
+  ok   AsyncWriter::Write: 
+  ok   AsyncWriter::Flush: 
+  ok   AsyncWriter::Finalize: 
+  ok   x-uds-transport-used == GRPC
+bidi read via AsyncClient::Open (gRPC BidiReadObject)
+  ok   AsyncClient::Open: 
+  ok   full read via ObjectDescriptor::ReadFromOffset: 
+  ok   ranged read via ObjectDescriptor::Read: 
+regular JSON upload is rejected on a zonal bucket
+  ok   InsertObject on zonal fails (the service reports an error with code UNKNOWN described as: This bucket requires appendable objects.)
+list + delete (gRPC)
+  ok   ListObjects finds zonal object
+  ok   AsyncClient::DeleteObject: 
+PASS
+verify_path: 8 Cloudpath peers, 0 DirectPath
+server pid=86349
+single-shot upload via storage::Client::InsertObject (JSON)
+  ok   InsertObject: 
+  ok   uploaded size matches
+resumable upload via storage::Client::WriteObject (JSON)
+  ok   WriteObject Close: 
+full read via storage::Client::ReadObject (JSON)
+  ok   ReadObject: 
+  ok   read back == written
+  ok   headers carry x-goog-hash crc32c
+ranged read via storage::Client::ReadObject (JSON)
+  ok   segment [1000, 5096): 
+list objects via storage::Client::ListObjects (gRPC)
+  ok   ListObjects finds both objects: 
+list buckets via storage::Client::ListBucketsForProject (gRPC)
+  ok   ListBucketsForProject: 
+bidi read via storage::AsyncClient::Open (gRPC)
+  GAP  BidiReadObject not enabled for this bucket: the service reports an error with code PERMISSION_DENIED described as: The BidiReadObject RPC is not yet available for general use, or for p
+errors
+  ok   missing object -> NOT_FOUND (the HTTP transport reports a [404] error: No such object: kalragauri-uds-poc-usw1/gcs-uds-poc/quickstart/1793856423577375684/regional.bin.does-not-exist)
+  ok   ifGenerationMatch=0 on existing -> FAILED_PRECONDITION (the service reports an error with code UNKNOWN described as: At least one of the pre-conditions you specified did not hold.)
+delete via storage::Client::DeleteObject (gRPC)
+  ok   DeleteObject
+  ok   DeleteObject resumable
+PASS
+verify_path: 8 Cloudpath peers, 0 DirectPath
+server pid=86834
+appendable upload via AsyncClient::StartAppendableObjectUpload (gRPC BidiWriteObject)
+  ok   StartAppendableObjectUpload: 
+  ok   AsyncWriter::Write: 
+  ok   AsyncWriter::Flush: 
+  ok   AsyncWriter::Finalize: 
+  ok   x-uds-transport-used == GRPC
+bidi read via AsyncClient::Open (gRPC BidiReadObject)
+  ok   AsyncClient::Open: 
+  ok   full read via ObjectDescriptor::ReadFromOffset: 
+  ok   ranged read via ObjectDescriptor::Read: 
+regular JSON upload is rejected on a zonal bucket
+  ok   InsertObject on zonal fails (the service reports an error with code UNKNOWN described as: This bucket requires appendable objects.)
+list + delete (gRPC)
+  ok   ListObjects finds zonal object
+  ok   AsyncClient::DeleteObject: 
+PASS
+verify_path: 8 Cloudpath peers, 0 DirectPath
+end=2026-11-05T05:29:25Z failed_runs=0
++ RUN=packaging-probes
++ bash /home/poc/poc/src/storage-uds-poc/scripts/probe_inproc.sh
++ tee /home/poc/poc/results/packaging-probes.log
+=== 1. Binary and archive sizes (bytes; stripped = strip -s) ===
+gcs-core-server        raw=    44642968 (  42.57 MiB)  stripped=    31974504 (  30.49 MiB)
+quickstart             raw=    46211120 (  44.07 MiB)  stripped=    34702808 (  33.10 MiB)
+quickstart_inproc      raw=    93709608 (  89.37 MiB)  stripped=    64837880 (  61.83 MiB)
+cold_start             raw=    30785288 (  29.36 MiB)  stripped=    23922288 (  22.81 MiB)
+cold_start_inproc      raw=    78293568 (  74.67 MiB)  stripped=    54061472 (  51.56 MiB)
+uds_poc_bench          raw=    94369256 (  90.00 MiB)  stripped=    65313056 (  62.29 MiB)
+libstorage_grpc_uds.a          raw=   128776884 ( 122.81 MiB)
+libgcs_core.a                  raw=      544518 (   0.52 MiB)
+libgcs_core_inproc.a           raw=      427396 (   0.41 MiB)
+libgcs_core_storage.a          raw=     1694110 (   1.62 MiB)
+libgcs_core_storage_inproc.a   raw=     1694110 (   1.62 MiB)
+libgcs_core_protos.a           raw=     1418212 (   1.35 MiB)
+--- ldd diff: quickstart vs quickstart_inproc ---
+same shared libraries
+
+=== 2. Cold Client::Create() in a fresh process (n=30) & footprint ===
+[sidecar-child-default] create_ms: n=30 min=85.14 p50=102.86 p90=119.31 p99=123.86 max=123.86
+[sidecar-child-default] core_pid=87792 | self VmSize:	 1431344 kB | self VmHWM:	   16692 kB | self VmRSS:	   16692 kB | self Threads:	20 | core VmSize:	13016336 kB | core VmHWM:	   18424 kB | core VmRSS:	   18424 kB | core Threads:	193
+[sidecar-child-wt8] create_ms: n=30 min=11.44 p50=98.24 p90=113.41 p99=124.80 max=124.80
+[sidecar-child-wt8] core_pid=94212 | self VmSize:	 1431344 kB | self VmHWM:	   16480 kB | self VmRSS:	   16480 kB | self Threads:	20 | core VmSize:	  576544 kB | core VmHWM:	   15708 kB | core VmRSS:	   15708 kB | core Threads:	9
+[sidecar-daemon-warm] create_ms: n=30 min=4.45 p50=5.83 p90=6.43 p99=6.60 max=6.60
+[sidecar-daemon-warm] core_pid=95112 | self VmSize:	 1357612 kB | self VmHWM:	   16732 kB | self VmRSS:	   16732 kB | self Threads:	19 | core VmSize:	13016304 kB | core VmHWM:	   18436 kB | core VmRSS:	   18436 kB | core Threads:	193
+[inproc-default] create_ms: n=30 min=19.75 p50=22.22 p90=23.21 p99=23.50 max=23.50
+[inproc-default] core_pid=95894 | self VmSize:	14432212 kB | self VmHWM:	   35188 kB | self VmRSS:	   35188 kB | self Threads:	212
+[inproc-wt8] create_ms: n=30 min=13.41 p50=14.78 p90=15.49 p99=16.65 max=16.65
+[inproc-wt8] core_pid=102284 | self VmSize:	 1995356 kB | self VmHWM:	   32040 kB | self VmRSS:	   32040 kB | self Threads:	28
+
+=== 3. Deployment environment probes ===
+--- 3a. UDS path > 107 bytes (row B8) ---
+PASS (>107B rejected): Client::Create: INVALID_ARGUMENT: socket path is 140 bytes; the limit is 107
+--- 3b. Stale socket & regular non-socket file at socket path (row B7) ---
+gcs-core-server pid=103162 listening on /tmp/tmp.udOjcoTe37/stale.sock
+PASS: stale socket unlinked and replaced cleanly
+PASS (regular file preserved): Client::Create: FAILED_PRECONDITION: socket path /tmp/tmp.udOjcoTe37/regular.file exists and is not a Unix socket
+--- 3c. Parent SIGKILL orphan cleanup (row B4) & SO_PEERCRED (row B9) ---
+gcs-core-server pid=103196 listening on /tmp/tmp.L58Pf84qvP/child.sock
+PASS: child gcs-core-server exited in 13 ms (<= 1000 ms) after parent SIGKILL
+PASS: mode 0600 + SO_PEERCRED rejected cross-UID client with PERMISSION_DENIED
+/home/poc/poc/src/storage-uds-poc/scripts/test_peer_cred.sh: line 33: 103230 Killed                  "$SERVER" --socket="$SOCK" --idle-secs=60 --endpoint=http://127.0.0.1:1 --shm-size=0 --grpc-subchannels=1 --worker-threads=2 > "$SRV_OUT" 2>&1
+--- 3d. noexec /tmp mount probe ---
+PASS (binary on noexec rejected): Client::Create: FAILED_PRECONDITION: sidecar binary from GCS_CORE_SERVER (/tmp/tmp.udOjcoTe37/noexec/gcs-core-server) is not an executable file
+gcs-core-server pid=103476 listening on /tmp/tmp.udOjcoTe37/noexec/ok.sock
+PASS: socket on noexec tmpfs works when binary is on exec mount
+--- 3e. Read-only filesystem probe (sidecar vs unix-abstract inproc) ---
+PASS (sidecar on RO FS without writable runtime dir fails cleanly): Error: Os { code: 30, kind: ReadOnlyFilesystem, message: "Read-only file system" }
+PASS: in-process variant (unix-abstract:) succeeds with read-only XDG_RUNTIME_DIR
+--- 3f. Container PID-1 namespace probe (unshare --pid --fork) ---
+gcs-core-server pid=10 listening on /tmp/tmp.udOjcoTe37/pid1.sock
+create_ms=11.4801
+core_pid=10
+PASS: child sidecar works inside PID namespace
+
+=== 4. Incremental 1-file rebuild times (cpus=192) ===
+cpp_client_cc_to_quickstart_sidecar=5.281 s
+cpp_client_cc_to_quickstart_inproc=6.491 s
+rust_service_rs_to_quickstart_sidecar=47.861 s
+rust_service_rs_to_quickstart_inproc=49.428 s
+proto_gcscore_to_quickstart_sidecar_and_inproc=62.617 s
+PROBES_DONE run=packaging-probes
++ gcloud storage cp --quiet /home/poc/poc/results/packaging-probes.log gs://kalragauri-uds-poc-ops/c4/results/probes/packaging-probes.log
+Copying file:///home/poc/poc/results/packaging-probes.log to gs://kalragauri-uds-poc-ops/c4/results/probes/packaging-probes.log
+  
+...

@@ -1,0 +1,8 @@
+host=kalragauri-uds-poc-c4 project=kalragauri-sdk-test instance_id=2425645790610435742 zone=us-central1-b machine=c4-standard-192 cpus=192
+phase=wt16 zonal=kalragauri-uds-poc-usw1-zonal worker_threads=16 start=2026-11-05T07:32:50Z
+ops_agent=active
+cpp_sha=36919ee42327802f1d1824b5e01a11031d0335f7 rust_sha=e432ad1de767f8b8094de70fcb3113ccba67310d
+kernel=7.0.0-1014-gcp glibc=2.39
+end=2026-11-05T07:50:59Z failed_runs=0
+phase=wt16-w4-300s zonal=kalragauri-uds-poc-usw1-zonal worker_threads=16 start=2026-11-05T08:52:53Z
+end=2026-11-05T09:08:25Z failed_runs=0

@@ -1,0 +1,55 @@
+=== 1. Binary and archive sizes (bytes; stripped = strip -s) ===
+gcs-core-server        raw=    44642968 (  42.57 MiB)  stripped=    31974504 (  30.49 MiB)
+quickstart             raw=    46211120 (  44.07 MiB)  stripped=    34702808 (  33.10 MiB)
+quickstart_inproc      raw=    93709608 (  89.37 MiB)  stripped=    64837880 (  61.83 MiB)
+cold_start             raw=    30785288 (  29.36 MiB)  stripped=    23922288 (  22.81 MiB)
+cold_start_inproc      raw=    78293568 (  74.67 MiB)  stripped=    54061472 (  51.56 MiB)
+uds_poc_bench          raw=    94369256 (  90.00 MiB)  stripped=    65313056 (  62.29 MiB)
+libstorage_grpc_uds.a          raw=   128776884 ( 122.81 MiB)
+libgcs_core.a                  raw=      544518 (   0.52 MiB)
+libgcs_core_inproc.a           raw=      427396 (   0.41 MiB)
+libgcs_core_storage.a          raw=     1694110 (   1.62 MiB)
+libgcs_core_storage_inproc.a   raw=     1694110 (   1.62 MiB)
+libgcs_core_protos.a           raw=     1418212 (   1.35 MiB)
+--- ldd diff: quickstart vs quickstart_inproc ---
+same shared libraries
+
+=== 2. Cold Client::Create() in a fresh process (n=30) & footprint ===
+[sidecar-child-default] create_ms: n=30 min=85.14 p50=102.86 p90=119.31 p99=123.86 max=123.86
+[sidecar-child-default] core_pid=87792 | self VmSize:	 1431344 kB | self VmHWM:	   16692 kB | self VmRSS:	   16692 kB | self Threads:	20 | core VmSize:	13016336 kB | core VmHWM:	   18424 kB | core VmRSS:	   18424 kB | core Threads:	193
+[sidecar-child-wt8] create_ms: n=30 min=11.44 p50=98.24 p90=113.41 p99=124.80 max=124.80
+[sidecar-child-wt8] core_pid=94212 | self VmSize:	 1431344 kB | self VmHWM:	   16480 kB | self VmRSS:	   16480 kB | self Threads:	20 | core VmSize:	  576544 kB | core VmHWM:	   15708 kB | core VmRSS:	   15708 kB | core Threads:	9
+[sidecar-daemon-warm] create_ms: n=30 min=4.45 p50=5.83 p90=6.43 p99=6.60 max=6.60
+[sidecar-daemon-warm] core_pid=95112 | self VmSize:	 1357612 kB | self VmHWM:	   16732 kB | self VmRSS:	   16732 kB | self Threads:	19 | core VmSize:	13016304 kB | core VmHWM:	   18436 kB | core VmRSS:	   18436 kB | core Threads:	193
+[inproc-default] create_ms: n=30 min=19.75 p50=22.22 p90=23.21 p99=23.50 max=23.50
+[inproc-default] core_pid=95894 | self VmSize:	14432212 kB | self VmHWM:	   35188 kB | self VmRSS:	   35188 kB | self Threads:	212
+[inproc-wt8] create_ms: n=30 min=13.41 p50=14.78 p90=15.49 p99=16.65 max=16.65
+[inproc-wt8] core_pid=102284 | self VmSize:	 1995356 kB | self VmHWM:	   32040 kB | self VmRSS:	   32040 kB | self Threads:	28
+
+=== 3. Deployment environment probes ===
+--- 3a. UDS path > 107 bytes (row B8) ---
+PASS (>107B rejected): Client::Create: INVALID_ARGUMENT: socket path is 140 bytes; the limit is 107
+--- 3b. Stale socket & regular non-socket file at socket path (row B7) ---
+PASS: stale socket unlinked and replaced cleanly
+PASS (regular file preserved): Client::Create: FAILED_PRECONDITION: socket path /tmp/tmp.udOjcoTe37/regular.file exists and is not a Unix socket
+--- 3c. Parent SIGKILL orphan cleanup (row B4) & SO_PEERCRED (row B9) ---
+PASS: child gcs-core-server exited in 13 ms (<= 1000 ms) after parent SIGKILL
+PASS: mode 0600 + SO_PEERCRED rejected cross-UID client with PERMISSION_DENIED
+--- 3d. noexec /tmp mount probe ---
+PASS (binary on noexec rejected): Client::Create: FAILED_PRECONDITION: sidecar binary from GCS_CORE_SERVER (/tmp/tmp.udOjcoTe37/noexec/gcs-core-server) is not an executable file
+PASS: socket on noexec tmpfs works when binary is on exec mount
+--- 3e. Read-only filesystem probe (sidecar vs unix-abstract inproc) ---
+PASS (sidecar on RO FS without writable runtime dir fails cleanly): Error: Os { code: 30, kind: ReadOnlyFilesystem, message: "Read-only file system" }
+PASS: in-process variant (unix-abstract:) succeeds with read-only XDG_RUNTIME_DIR
+--- 3f. Container PID-1 namespace probe (unshare --pid --fork) ---
+create_ms=11.4801
+core_pid=10
+PASS: child sidecar works inside PID namespace
+
+=== 4. Incremental 1-file rebuild times (cpus=192) ===
+cpp_client_cc_to_quickstart_sidecar=5.281 s
+cpp_client_cc_to_quickstart_inproc=6.491 s
+rust_service_rs_to_quickstart_sidecar=47.861 s
+rust_service_rs_to_quickstart_inproc=49.428 s
+proto_gcscore_to_quickstart_sidecar_and_inproc=62.617 s
+PROBES_DONE run=packaging-probes
