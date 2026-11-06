@@ -18,6 +18,7 @@ Usage:
   analyze.py RESULTS_DIR > summary.md
   analyze.py RESULTS_DIR --doc-tables > doc_tables.md
   analyze.py WT_RESULTS_DIR --sensitivity BASE_RESULTS_DIR > sensitivity.md
+  analyze.py RERUN_DIR --base BASE_RESULTS_DIR [--doc-tables] > merged.md
 
 Reads `<cell>-<mode>.summary.json`, `<cell>-<mode>.monitoring.json` (when
 present), and `<cell>-<mode>.path.json` for every cell in `RESULTS_DIR`, checks
@@ -39,6 +40,11 @@ Monitoring values whose window is missing 60 s buckets are marked with `‡`.
 `--sensitivity BASE_DIR` compares the UDS comparators of `WT_RESULTS_DIR` (a
 `--worker-threads=N` run) against the same cells in `BASE_DIR` (default worker
 threads). The two modes are mutually exclusive.
+
+`--base BASE_DIR` renders `BASE_DIR` with every cell that `RESULTS_DIR` also
+contains replaced, whole, by the `RESULTS_DIR` measurement (a targeted re-run),
+and lists which run each cell came from together with both `run-info.txt`
+blocks. It combines with the summary and `--doc-tables`, not `--sensitivity`.
 """
 
 import argparse
@@ -132,16 +138,60 @@ def format_ratio(num: float, den: float) -> str:
   return f"{num / den:.2f}x"
 
 
+def read_run_info(results_dir: str) -> str | None:
+  info_path = os.path.join(results_dir, "run-info.txt")
+  if not os.path.exists(info_path):
+    return None
+  with open(info_path, "r", encoding="utf-8") as fh:
+    return fh.read().strip()
+
+
+def overlay_cells(
+    base_cells: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    new_cells: Mapping[str, Mapping[str, Mapping[str, Any]]],
+) -> dict[str, Mapping[str, Mapping[str, Any]]]:
+  """Returns `base_cells` with every cell present in `new_cells` replaced.
+
+  A cell is replaced as a whole (all comparators), never merged per mode: a
+  table must not mix comparators measured by different harness revisions.
+  Replaced cells keep their position; cells only in `new_cells` are appended.
+  """
+  merged: dict[str, Mapping[str, Mapping[str, Any]]] = dict(base_cells)
+  merged.update(new_cells)
+  return merged
+
+
+def render_provenance(base_dir: str, overlay_dir: str,
+                      overlaid: Sequence[str]) -> list[str]:
+  """Lists which run each cell came from, with both `run-info.txt` blocks."""
+  base_name = os.path.basename(os.path.abspath(base_dir))
+  overlay_name = os.path.basename(os.path.abspath(overlay_dir))
+  lines = [
+      f"Cells re-measured in `{overlay_name}` replace the same cells of "
+      f"`{base_name}`: " + ", ".join(f"`{c}`" for c in sorted(overlaid)) +
+      f". All other cells come from `{base_name}`.",
+      "",
+  ]
+  for label, directory in (("Base run", base_dir), ("Overlay run", overlay_dir)):
+    info = read_run_info(directory)
+    if info is None:
+      continue
+    lines += [f"{label} (`{os.path.basename(os.path.abspath(directory))}`):",
+              "", "```text", info, "```", ""]
+  return lines
+
+
 def render_markdown(
-    results_dir: str, cells: Mapping[str, Mapping[str, Mapping[str, Any]]]
+    results_dir: str, cells: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    provenance: Sequence[str] = ()
 ) -> str:
   lines: list[str] = []
-  info_path = os.path.join(results_dir, "run-info.txt")
   lines.append(f"# Benchmark Summary (`{os.path.basename(os.path.abspath(results_dir))}`)")
   lines.append("")
-  if os.path.exists(info_path):
-    with open(info_path, "r", encoding="utf-8") as fh:
-      info = fh.read().strip()
+  info = read_run_info(results_dir)
+  if provenance:
+    lines.extend(provenance)
+  elif info is not None:
     lines.append("```text")
     lines.append(info)
     lines.append("```")
@@ -398,13 +448,16 @@ def doc_metric_rows(entry: Mapping[str, Any],
 
 
 def render_doc_tables(
-    results_dir: str, cells: Mapping[str, Mapping[str, Mapping[str, Any]]]
+    results_dir: str, cells: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    provenance: Sequence[str] = ()
 ) -> str:
   """Renders the worklog "Benchmarking Results" tables for one results dir."""
   lines: list[str] = []
   lines.append(
       f"# Worklog tables (`{os.path.basename(os.path.abspath(results_dir))}`)")
   lines.append("")
+  if provenance:
+    lines.extend(provenance)
   lines.append(
       "`% Diff` is `(UDS - Native) / Native`; negative latency, CPU, and "
       "memory deltas and positive throughput deltas favor the UDS comparator. "
@@ -512,15 +565,31 @@ def main(argv: Sequence[str] | None = None) -> int:
   modes.add_argument("--sensitivity", metavar="BASE_DIR",
                      help="compare UDS comparators of RESULTS_DIR against "
                      "the same cells in BASE_DIR")
+  parser.add_argument("--base", metavar="BASE_DIR",
+                      help="render BASE_DIR with every cell present in "
+                      "RESULTS_DIR replaced by the RESULTS_DIR measurement")
   args = parser.parse_args(argv)
   if args.sensitivity is not None and not args.sensitivity:
     parser.error("--sensitivity requires a non-empty BASE_DIR")
+  if args.base is not None and not args.base:
+    parser.error("--base requires a non-empty BASE_DIR")
+  if args.base and args.sensitivity:
+    parser.error("--base cannot be combined with --sensitivity")
 
   cells = discover_cells(args.results_dir)
   if not cells:
     print(f"analyze: no *.summary.json files found in {args.results_dir!r}",
           file=sys.stderr)
     return 1
+  provenance: list[str] = []
+  if args.base:
+    base_cells = discover_cells(args.base)
+    if not base_cells:
+      print(f"analyze: no *.summary.json files found in {args.base!r}",
+            file=sys.stderr)
+      return 1
+    provenance = render_provenance(args.base, args.results_dir, list(cells))
+    cells = overlay_cells(base_cells, cells)
   if args.sensitivity:
     base_cells = discover_cells(args.sensitivity)
     if not base_cells:
@@ -531,9 +600,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                                         args.results_dir, cells))
     return 0
   if args.doc_tables:
-    sys.stdout.write(render_doc_tables(args.results_dir, cells))
+    sys.stdout.write(render_doc_tables(args.results_dir, cells, provenance))
     return 0
-  sys.stdout.write(render_markdown(args.results_dir, cells))
+  sys.stdout.write(render_markdown(args.results_dir, cells, provenance))
   return 0
 
 

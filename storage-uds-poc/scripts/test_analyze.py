@@ -260,6 +260,67 @@ class AnalyzeTest(unittest.TestCase):
         analyze.main([tmp, "--doc-tables", "--sensitivity", tmp])
       with self.assertRaises(SystemExit):
         analyze.main([tmp, "--sensitivity", ""])
+      with self.assertRaises(SystemExit):
+        analyze.main([tmp, "--base", ""])
+      with self.assertRaises(SystemExit):
+        analyze.main([tmp, "--base", tmp, "--sensitivity", tmp])
+
+  def test_base_overlay_replaces_whole_cells_and_records_provenance(
+      self) -> None:
+    with tempfile.TemporaryDirectory() as base, \
+        tempfile.TemporaryDirectory() as rerun:
+      # Base run: W4 for all three comparators plus a W3 cell the re-run does
+      # not touch. The re-run measures W4 for native and sidecar only.
+      for mode, p50 in (("native", 4000.0), ("uds-sidecar", 5000.0),
+                        ("uds-inproc", 3000.0)):
+        self._write_w4_cell(base, mode, range_p50=p50, mb_s=500.0,
+                            cpu_avg=1.0)
+      with open(os.path.join(base, "random8k-zonal-native.summary.json"), "w",
+                encoding="utf-8") as fh:
+        json.dump(dict(_make_summary("native", 35000.0), workload="random8k",
+                       window_wall_secs=10.0, total_bytes=10 * 8192),
+                  fh)
+      with open(os.path.join(base, "run-info.txt"), "w", encoding="utf-8") as fh:
+        fh.write("cpp_sha=base-sha\n")
+      self._write_w4_cell(rerun, "native", range_p50=6000.0, mb_s=700.0,
+                          cpu_avg=1.0)
+      self._write_w4_cell(rerun, "uds-sidecar", range_p50=6600.0, mb_s=650.0,
+                          cpu_avg=1.0)
+      with open(os.path.join(rerun, "run-info.txt"), "w",
+                encoding="utf-8") as fh:
+        fh.write("cpp_sha=rerun-sha\n")
+
+      merged = analyze.overlay_cells(analyze.discover_cells(base),
+                                     analyze.discover_cells(rerun))
+      # The re-run cell replaces the base cell as a whole: the base in-process
+      # comparator is dropped rather than mixed with re-run comparators.
+      self.assertEqual(sorted(merged["bidi-read-48t-zonal"]),
+                       ["native", "uds-sidecar"])
+      self.assertEqual(
+          merged["bidi-read-48t-zonal"]["native"]["summary"]
+          ["range_latency_us"]["p50"], 6000.0)
+      self.assertIn("random8k-zonal", merged)
+
+      provenance = analyze.render_provenance(base, rerun,
+                                             ["bidi-read-48t-zonal"])
+      text = "\n".join(provenance)
+      self.assertIn(f"Cells re-measured in `{os.path.basename(rerun)}` "
+                    f"replace the same cells of `{os.path.basename(base)}`: "
+                    "`bidi-read-48t-zonal`.", text)
+      self.assertIn("cpp_sha=base-sha", text)
+      self.assertIn("cpp_sha=rerun-sha", text)
+      doc = analyze.render_doc_tables(rerun, merged, provenance)
+      self.assertIn("cpp_sha=rerun-sha", doc)
+      self.assertIn("| Latency P50 (per range) | 6.0 ms | 6.6 ms | +10.0% |",
+                    doc)
+      self.assertEqual(analyze.main([rerun, "--base", base, "--doc-tables"]), 0)
+
+  def test_base_overlay_with_empty_base_dir_fails(self) -> None:
+    with tempfile.TemporaryDirectory() as base, \
+        tempfile.TemporaryDirectory() as rerun:
+      self._write_w4_cell(rerun, "native", range_p50=6000.0, mb_s=700.0,
+                          cpu_avg=1.0)
+      self.assertEqual(analyze.main([rerun, "--base", base]), 1)
 
 
 if __name__ == "__main__":
