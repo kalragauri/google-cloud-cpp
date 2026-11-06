@@ -58,6 +58,7 @@ BUCKET_PREFIX="${BUCKET_PREFIX:-}"
 ALLOW_REGIONAL_BIDI="${ALLOW_REGIONAL_BIDI:-0}"
 WORKER_THREADS="${WORKER_THREADS:-0}"
 MONITORING_FLUSH_SECS="${MONITORING_FLUSH_SECS:-240}"
+WORKLOADS="${WORKLOADS:-}"
 POC="${POC:-$HOME/poc/src/storage-uds-poc}"
 BUILD="$POC/cmake-out"
 RUN="${RUN:-$PHASE-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -73,6 +74,20 @@ fatal() {
 [[ "$MONITORING_FLUSH_SECS" =~ ^[0-9]+$ ]] ||
   fatal "MONITORING_FLUSH_SECS must be a non-negative integer, got" \
     "'$MONITORING_FLUSH_SECS'"
+
+# WORKLOADS (comma-separated) restricts a phase to a subset of its cells, for
+# re-measuring individual workloads without repeating the whole matrix.
+KNOWN_WORKLOADS=",open,read50x2x4-serial,read50x2x4-concurrent,random8k,bidi-read-48t,bidi-write-48t,list-objects-100,list-buckets-100,"
+if [[ -n "$WORKLOADS" ]]; then
+  IFS=',' read -r -a requested <<<"$WORKLOADS"
+  for w in "${requested[@]}"; do
+    [[ -n "$w" && "$KNOWN_WORKLOADS" == *",$w,"* ]] ||
+      fatal "unknown workload '$w' in WORKLOADS=$WORKLOADS"
+  done
+fi
+wanted() {
+  [[ -z "$WORKLOADS" || ",$WORKLOADS," == *",$1,"* ]]
+}
 
 case "$PHASE" in
   probes)
@@ -129,7 +144,7 @@ CPP_SHA="$(git -C "$POC/.." rev-parse HEAD 2>/dev/null || echo unknown)"
 
 {
   echo "host=$(hostname) project=$PROJECT instance_id=$INSTANCE_ID zone=$ZONE machine=$MACHINE cpus=$(nproc)"
-  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX worker_threads=$WORKER_THREADS monitoring_flush_secs=$MONITORING_FLUSH_SECS start=$(date -u +%FT%TZ)"
+  echo "phase=$PHASE regional=$REGIONAL zonal=$ZONAL bucket_prefix=$BUCKET_PREFIX worker_threads=$WORKER_THREADS monitoring_flush_secs=$MONITORING_FLUSH_SECS workloads=${WORKLOADS:-all} start=$(date -u +%FT%TZ)"
   echo "ops_agent=$(systemctl is-active google-cloud-ops-agent)"
   echo "cpp_sha=$CPP_SHA rust_sha=$RUST_SHA"
   echo "kernel=$(uname -r) glibc=$(ldd --version | head -1 | awk '{print $NF}')"
@@ -274,45 +289,55 @@ for target in "${BIDI_TARGETS[@]}"; do
   btype="${target%%:*}"
   bname="${target#*:}"
   for w in "${SHORT_WORKLOADS[@]}"; do
-    for mode in $(rotate "$k" "${COMPS[@]}"); do
-      run_cell "${w}-${btype}" "$mode" \
-        --workload="$w" --bucket="$bname" --bucket-type="$btype" \
-        --duration-secs="$DUR_SHORT"
-    done
+    if wanted "$w"; then
+      for mode in $(rotate "$k" "${COMPS[@]}"); do
+        run_cell "${w}-${btype}" "$mode" \
+          --workload="$w" --bucket="$bname" --bucket-type="$btype" \
+          --duration-secs="$DUR_SHORT"
+      done
+    fi
     k=$((k + 1))
   done
 
   # --- W4: 48-thread BidiRead, 16 MiB ranges (last 8 MiB) of a 200 MiB object -
-  for mode in $(rotate "$k" "${COMPS[@]}"); do
-    run_cell "bidi-read-48t-${btype}" "$mode" \
-      --workload=bidi-read-48t --bucket="$bname" --bucket-type="$btype" \
-      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
-  done
+  if wanted bidi-read-48t; then
+    for mode in $(rotate "$k" "${COMPS[@]}"); do
+      run_cell "bidi-read-48t-${btype}" "$mode" \
+        --workload=bidi-read-48t --bucket="$bname" --bucket-type="$btype" \
+        --threads="$THREADS_48" --duration-secs="$DUR_LONG"
+    done
+  fi
   k=$((k + 1))
 done
 
 if [[ "$PHASE" == "smoke" || "$PHASE" == "full" ]]; then
   # --- W5: 48-thread appendable BidiWrite 200 MB object + Finalize (zonal) ----
-  for mode in $(rotate "$k" "${COMPS[@]}"); do
-    run_cell "bidi-write-48t-zonal" "$mode" \
-      --workload=bidi-write-48t --bucket="$ZONAL" --bucket-type=zonal \
-      --threads="$THREADS_48" --duration-secs="$DUR_LONG"
-  done
+  if wanted bidi-write-48t; then
+    for mode in $(rotate "$k" "${COMPS[@]}"); do
+      run_cell "bidi-write-48t-zonal" "$mode" \
+        --workload=bidi-write-48t --bucket="$ZONAL" --bucket-type=zonal \
+        --threads="$THREADS_48" --duration-secs="$DUR_LONG"
+    done
+  fi
   k=$((k + 1))
 
   # --- W6: ListObjects (100 items, regional) & ListBuckets (100 items) --------
-  for mode in $(rotate "$k" "${COMPS[@]}"); do
-    run_cell "list-objects-100-regional" "$mode" \
-      --workload=list-objects-100 --bucket="$REGIONAL" --bucket-type=regional \
-      --duration-secs="$DUR_SHORT"
-  done
+  if wanted list-objects-100; then
+    for mode in $(rotate "$k" "${COMPS[@]}"); do
+      run_cell "list-objects-100-regional" "$mode" \
+        --workload=list-objects-100 --bucket="$REGIONAL" --bucket-type=regional \
+        --duration-secs="$DUR_SHORT"
+    done
+  fi
   k=$((k + 1))
 
-  for mode in $(rotate "$k" "${COMPS[@]}"); do
-    run_cell "list-buckets-100-project" "$mode" \
-      --workload=list-buckets-100 --project="$PROJECT" \
-      --bucket-prefix="$BUCKET_PREFIX" --duration-secs="$DUR_SHORT"
-  done
+  if wanted list-buckets-100; then
+    for mode in $(rotate "$k" "${COMPS[@]}"); do
+      run_cell "list-buckets-100-project" "$mode" \
+        --workload=list-buckets-100 --project="$PROJECT" \
+        --bucket-prefix="$BUCKET_PREFIX" --duration-secs="$DUR_SHORT"
+    done
+  fi
   k=$((k + 1))
 fi
 

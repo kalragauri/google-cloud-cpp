@@ -198,6 +198,44 @@ expect smoke rc "$rc" 0
 expect smoke cells "$(count_cells)" 24
 expect smoke "short durations" "$(count_flag '--duration-secs=3')" 18
 
+# --- WORKLOADS filter ------------------------------------------------------------
+# mode_order CELL prints the comparator order of CELL's cells in $LAST_LOG.
+mode_order() {
+  python3 - "$LAST_LOG" "$1" <<'PY'
+import sys
+cell = sys.argv[2]
+modes = []
+for l in open(sys.argv[1]):
+    if l.startswith("######## " + cell + "-"):
+        modes.append(l.split()[1][len(cell) + 1:])
+print(",".join(modes))
+PY
+}
+PARITY=read50x2x4-serial,read50x2x4-concurrent,bidi-read-48t
+run_phase full env PHASE=full REGIONAL=rb ZONAL=zb BUCKET_PREFIX=p-
+FULL_W2A_ORDER="$(mode_order read50x2x4-serial-zonal)"
+FULL_W4_ORDER="$(mode_order bidi-read-48t-zonal)"
+run_phase full-filtered env PHASE=full REGIONAL=rb ZONAL=zb BUCKET_PREFIX=p- WORKLOADS="$PARITY"; rc=$?
+expect full-filtered rc "$rc" 0
+expect full-filtered cells "$(count_cells)" 9
+expect full-filtered "W5/W6 cells" "$(count_flag '--workload=bidi-write-48t')$(count_flag '--workload=list-')" 00
+expect full-filtered "W1/W3 cells" "$(count_flag '--workload=open ')$(count_flag '--workload=random8k')" 00
+# Skipped workloads still advance the rotation, so each re-run cell keeps the
+# comparator order it had in the full matrix.
+expect full-filtered "W2a comparator order" "$(mode_order read50x2x4-serial-zonal)" "$FULL_W2A_ORDER"
+expect full-filtered "W4 comparator order" "$(mode_order bidi-read-48t-zonal)" "$FULL_W4_ORDER"
+expect_log full-filtered "workloads=$PARITY"
+run_phase regional-filtered env PHASE=regional REGIONAL=rb WORKLOADS="$PARITY"; rc=$?
+expect regional-filtered rc "$rc" 0
+expect regional-filtered cells "$(count_cells)" 9
+expect regional-filtered "regional cells" "$(count_flag '--bucket-type=regional')" 9
+run_phase filter-unknown env PHASE=full REGIONAL=rb ZONAL=zb BUCKET_PREFIX=p- WORKLOADS=open,bogus; rc=$?
+expect filter-unknown rc "$rc" 1
+expect filter-unknown cells "$(count_cells)" 0
+expect_log filter-unknown "unknown workload 'bogus'"
+run_phase filter-empty-item env PHASE=full REGIONAL=rb ZONAL=zb BUCKET_PREFIX=p- WORKLOADS=open,,random8k; rc=$?
+expect filter-empty-item rc "$rc" 1
+
 # --- Regional gate ---------------------------------------------------------------
 run_phase regional-gap env PHASE=regional REGIONAL=rb GATE_RESULT=gap; rc=$?
 expect regional-gap rc "$rc" 1
