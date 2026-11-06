@@ -1,4 +1,4 @@
-# Worklog tables (`full-parity`)
+# Per-workload tables (`full-parity`)
 
 Cells re-measured in `full-parity` replace the same cells of `full`: `bidi-read-48t-zonal`, `read50x2x4-concurrent-zonal`, `read50x2x4-serial-zonal`. All other cells come from `full`.
 

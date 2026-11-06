@@ -14,7 +14,7 @@
 # limitations under the License.
 
 # VM job: packaging, build-time, cold-start, and customer-environment deployment
-# probes for plan rev 4 §12 (Challenges table rows 2, 3, 5, 7):
+# probes:
 #   1. Raw & stripped binary and archive sizes + shared-library (`ldd`) diff.
 #   2. Incremental one-file rebuild wall times (C++ TU, Rust `service.rs`,
 #      `gcscore.proto`).
@@ -138,7 +138,7 @@ HERMETIC_ARGS=(
   --sidecar-arg=--worker-threads=2
 )
 
-echo "--- 3a. UDS path > 107 bytes (row B8) ---"
+echo "--- 3a. UDS path > 107 bytes ---"
 LONG_SOCK="$TMP/$(python3 - <<'PY'
 print("a" * 115 + ".sock")
 PY
@@ -149,7 +149,7 @@ else
   echo "PASS (>107B rejected): $(cat "$TMP/long.err")"
 fi
 
-echo "--- 3b. Stale socket & regular non-socket file at socket path (row B7) ---"
+echo "--- 3b. Stale socket & regular non-socket file at socket path ---"
 python3 - "$TMP/stale.sock" <<'PY'
 import socket, sys
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -165,7 +165,7 @@ else
   echo "PASS (regular file preserved): $(head -n 1 "$TMP/reg.err")"
 fi
 
-echo "--- 3c. Parent SIGKILL orphan cleanup (row B4) & SO_PEERCRED (row B9) ---"
+echo "--- 3c. Parent SIGKILL orphan cleanup & SO_PEERCRED ---"
 bash "$POC/scripts/test_parent_crash.sh"
 bash "$POC/scripts/test_peer_cred.sh"
 

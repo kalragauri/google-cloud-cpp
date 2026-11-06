@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Unified benchmark harness for the GCS SDK Consolidation UDS POC (plan rev 4).
+// Unified benchmark harness for the GCS SDK Consolidation UDS POC.
 //
 // Drives all three comparators (`native`, `uds-sidecar`, `uds-inproc`) through
 // the unmodified public `google::cloud::storage::Client` and
@@ -133,7 +133,7 @@ struct Config {
 };
 
 /// Deterministic SplitMix64 PRNG so all comparators read identical offsets in
-/// `random8k` regardless of standard-library implementation (plan §7.1 R4).
+/// `random8k` regardless of standard-library implementation.
 class SplitMix64 {
  public:
   explicit SplitMix64(std::uint64_t seed) : state_(seed) {}
@@ -439,7 +439,7 @@ gc::StatusOr<Clients> BuildClients(Config const& cfg) {
   auto const cq_pool = static_cast<std::size_t>(cfg.cq_threads);
   if (cfg.mode == ComparatorMode::kNative) {
     // Explicit Cloudpath endpoint prevents `DefaultOptionsGrpc` from selecting
-    // DirectPath (`google-c2p:///`) on GCE, matching the Rust core (R1).
+    // DirectPath (`google-c2p:///`) on GCE, matching the Rust core.
     gc::Options grpc_opts =
         gc::Options{}
             .set<gc::EndpointOption>(std::string(kCloudpathEndpoint))
@@ -1056,7 +1056,7 @@ int main(int argc, char* argv[]) {
   }
   Clients clients = *std::move(built);
 
-  // --- Dataset setup (outside warmup and timed window, plan §5) --------------
+  // --- Dataset setup (outside warmup and timed window) -----------------------
   std::string const staged_object =
       absl::StrCat(cfg.prefix, "staged-", cfg.object_size, "B.bin");
   std::string const list_prefix = absl::StrCat(cfg.prefix, "list100/");
@@ -1102,7 +1102,7 @@ int main(int argc, char* argv[]) {
   std::vector<std::string> created_objects;
 
   // W3 keeps a single open ObjectDescriptor across the run ("random 8 KiB
-  // ranges from an open 100 MiB object", plan §5).
+  // ranges from an open 100 MiB object").
   std::optional<gcs::ObjectDescriptor> w3_descriptor;
   gc::Status w3_open_error;
   if (cfg.workload == WorkloadKind::kRandom8k) {

@@ -53,7 +53,7 @@ cat > "$POC/cmake-out/gcs-core-server" <<'EOF'
 exit 0
 EOF
 # GATE_RESULT selects the quickstart outcome: ok (default), gap (BidiReadObject
-# rejected by the allow list, exit 0), or fail (quickstart itself failed).
+# not enabled for the project, exit 0), or fail (quickstart itself failed).
 cat > "$POC/cmake-out/quickstart_inproc" <<'EOF'
 #!/bin/bash
 case "${GATE_RESULT:-ok}" in

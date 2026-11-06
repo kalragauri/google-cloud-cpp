@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for monitoring.py (plan rev 4 §8 rows D1 and D2)."""
+"""Unit tests for monitoring.py."""
 
 import json
 import os
@@ -176,7 +176,7 @@ class MonitoringTest(unittest.TestCase):
     )
 
   def test_query_window_metrics_aggregates_cpu_and_memory(self) -> None:
-    # Pins rows D1 and D2: instance_id + state="used" filters, 60s ALIGN_MEAN,
+    # Pins the query shape: instance_id + state="used" filters, 60s ALIGN_MEAN,
     # pagination across nextPageToken, chronological ordering, CPU avg/max, and
     # peak memory percent. The window ends on a minute boundary so the three
     # recorded points (12:02, 12:03, 12:04) fill the padded window exactly.

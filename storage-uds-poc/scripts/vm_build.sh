@@ -19,7 +19,7 @@
 #   SRC_TGZ   GCS object path of the google-cloud-cpp source tarball
 #   RUST_TGZ  optional GCS object path of a google-cloud-rust tarball; when
 #             unset, CMake FetchContent clones GCS_CORE_RUST_REPO at
-#             GCS_CORE_RUST_REF (plan rev 4 §3.4).
+#             GCS_CORE_RUST_REF.
 set -euxo pipefail
 OPS="${OPS:?OPS bucket must be set}"
 SRC_TGZ="${SRC_TGZ:-src/google-cloud-cpp-uds-poc.tgz}"

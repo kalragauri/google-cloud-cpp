@@ -14,7 +14,7 @@
 # limitations under the License.
 """Queries Cloud Monitoring VM CPU and Ops Agent memory over a workload window.
 
-Implements plan rev 4 §8 rows D1 and D2:
+Metrics:
   * CPU:    `compute.googleapis.com/instance/cpu/utilization`
             filtered by `resource.labels.instance_id`, 60 s `ALIGN_MEAN`,
             reports `avg` and `max` (both raw [0, 1] fraction and percent).

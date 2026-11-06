@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Unit tests for verify_path.py (plan rev 4 §8 row C1)."""
+"""Unit tests for verify_path.py."""
 
 import pathlib
 import sys

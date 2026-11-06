@@ -98,10 +98,9 @@ counts any open that still happened inside the measured window. W4 checks the
 deadline before every range; bytes of an object cut short by the deadline count
 toward throughput (`partial_bytes`) but not as an operation or latency sample.
 
-Regional `BidiReadObject` is admitted per bucket-owning project (preview
-allow list). `regional`, and `full` with
-`ALLOW_REGIONAL_BIDI=1`, first run `quickstart_inproc` against the regional
-bucket and abort — before any cell, recording `gate=FAILED` in `run-info.txt` —
+Regional `BidiReadObject` is enabled per bucket-owning project. `regional`, and
+`full` with `ALLOW_REGIONAL_BIDI=1`, start by running `quickstart_inproc` against
+the regional bucket and abort — before any cell, recording `gate=FAILED` in `run-info.txt` —
 when it reports the `GAP  BidiReadObject` marker (the service answered
 `PERMISSION_DENIED`) or when the quickstart itself fails. Summaries render with
 `scripts/analyze.py RESULTS_DIR [--doc-tables | --sensitivity BASE_DIR]`; the

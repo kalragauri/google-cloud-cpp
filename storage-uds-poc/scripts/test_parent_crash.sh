@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pins input-matrix row B4 (plan rev 4 §8):
+# Pins the parent-crash cleanup contract:
 # In 1:1 child mode (`--child` -> `SidecarMode::kChild`), `gcs-core-server` is
 # spawned from a long-lived helper thread with `--pdeathsig=true --idle-secs=0`.
 # Sending `SIGKILL` to the parent process must cause the child `gcs-core-server`

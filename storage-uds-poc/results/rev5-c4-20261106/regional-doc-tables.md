@@ -1,4 +1,4 @@
-# Worklog tables (`regional-parity`)
+# Per-workload tables (`regional-parity`)
 
 Cells re-measured in `regional-parity` replace the same cells of `regional`: `bidi-read-48t-regional`, `read50x2x4-concurrent-regional`, `read50x2x4-serial-regional`. All other cells come from `regional`.
 

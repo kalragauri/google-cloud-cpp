@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Pins input-matrix row B9 (plan rev 4 §8):
+# Pins the peer-credential isolation contract:
 # 1. `gcs-core-server` binds its Unix domain socket with mode `0600`.
 # 2. Even if filesystem mode bits are bypassed (e.g. `chmod 0666` or an abstract
 #    socket), a client running under another UID (`nobody`) is rejected by the

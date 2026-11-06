@@ -13,9 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# GCE startup script for the benchmark VM (plan rev 4 §11):
+# GCE startup script for the benchmark VM:
 #   1. Installs and verifies Google Cloud Ops Agent so
-#      `agent.googleapis.com/memory/percent_used{state=used}` is exported (D2/D3).
+#      `agent.googleapis.com/memory/percent_used{state=used}` is exported.
 #   2. Installs `poc-runner.service` polling `gs://$OPS/jobs/*.sh` and uploading
 #      live logs and `.exit` codes to `gs://$OPS/results/`.
 set -euo pipefail
@@ -31,7 +31,7 @@ done
 OPS="$(curl -fsS -H Metadata-Flavor:Google "$MDS/instance/attributes/ops-bucket")"
 SA_EMAIL="$(curl -fsS -H Metadata-Flavor:Google "$MDS/instance/service-accounts/default/email")"
 
-# Install Google Cloud Ops Agent if not already active (plan rev 4 §8 row D3).
+# Install Google Cloud Ops Agent if not already active.
 if ! systemctl is-active --quiet google-cloud-ops-agent; then
   TMP_OPS="$(mktemp -d)"
   curl -sS https://dl.google.com/cloudagents/add-google-cloud-ops-agent-repo.sh \

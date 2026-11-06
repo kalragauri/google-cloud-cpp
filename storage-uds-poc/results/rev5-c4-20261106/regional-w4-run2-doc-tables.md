@@ -1,4 +1,4 @@
-# Worklog tables (`regional-parity-r2`)
+# Per-workload tables (`regional-parity-r2`)
 
 `% Diff` is `(UDS - Native) / Native`; negative latency, CPU, and memory deltas and positive throughput deltas favor the UDS comparator. Latency rows name their basis: `per op` is one benchmark operation; `per range` (W4) is one `ObjectDescriptor::Read` range, 13 per 200 MiB object (twelve of 16 MiB and a final 8 MiB range). `‡` marks a Monitoring series with fewer points than the window has 60 s buckets.
 

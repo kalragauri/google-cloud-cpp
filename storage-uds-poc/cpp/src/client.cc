@@ -239,7 +239,7 @@ Status Connection::WaitUntilReadyLocked(StubSet const& set) {
       Status s = FromGrpc(stub->Ping(&ctx, request, &response));
       if (!s.ok()) {
         // Peer-credential rejection (`SO_PEERCRED` on another user's socket) is
-        // terminal: fail fast without killing the peer's daemon (row B9).
+        // terminal: fail fast without killing the peer's daemon.
         if (s.code() == StatusCode::kPermissionDenied ||
             s.code() == StatusCode::kUnauthenticated) {
           return s;

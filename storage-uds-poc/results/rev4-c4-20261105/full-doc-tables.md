@@ -1,4 +1,4 @@
-# Worklog tables (`full`)
+# Per-workload tables (`full`)
 
 `% Diff` is `(UDS - Native) / Native`; negative latency, CPU, and memory deltas and positive throughput deltas favor the UDS comparator. W4 latency is per 16 MiB range.
 

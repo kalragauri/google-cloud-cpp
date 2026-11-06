@@ -150,7 +150,7 @@ void Regional(gcs::Client& client, gcs::AsyncClient& async_client,
   std::cout << "bidi read via storage::AsyncClient::Open (gRPC)\n";
   StatusOr<gcs::ObjectDescriptor> descriptor =
       async_client.Open(gcs::BucketName(bucket), name).get();
-  // BidiReadObject is allow-listed per project/bucket by the service; report
+  // BidiReadObject is enabled per project/bucket by the service; report
   // that as an environment gap rather than an adapter failure.
   if (!descriptor &&
       descriptor.status().code() == StatusCode::kPermissionDenied &&

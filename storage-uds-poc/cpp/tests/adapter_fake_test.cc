@@ -14,7 +14,7 @@
 
 // Unit tests for `UdsStorageConnection` (`storage::Client`) and
 // `UdsAsyncConnection` (`storage::AsyncClient`) against an in-memory fake
-// `gcscore.v1.GcsCore` gRPC-over-UDS server, pinning input-matrix rows A1–A27.
+// `gcscore.v1.GcsCore` gRPC-over-UDS server.
 
 #include "google/cloud/storage/async/client.h"
 #include "google/cloud/storage/async/retry_policy.h"
@@ -478,7 +478,7 @@ StatusOr<std::string> ReadAllAsync(
   return out;
 }
 
-/// @test Matrix row A1: `Client::ReadObject` streams whole object contents and
+/// @test `Client::ReadObject` streams whole object contents and
 /// sets `DisableCrc32cChecksum` default (`ChecksumAlgorithm::kNone`).
 TEST_F(AdapterFakeTest, ReadWhole) {
   std::string const want = "0123456789abcdefghijKLMNOP";
@@ -500,7 +500,7 @@ TEST_F(AdapterFakeTest, ReadWhole) {
   EXPECT_EQ(req.transport(), pb::JSON);
 }
 
-/// @test Matrix row A1: `ObjectReadStream` exposes metadata and HTTP headers
+/// @test `ObjectReadStream` exposes metadata and HTTP headers
 /// from the first `ReadChunk.meta`.
 TEST_F(AdapterFakeTest, ReadMetadataHeaders) {
   fake_.objects["meta.txt"] = "payload";
@@ -522,7 +522,7 @@ TEST_F(AdapterFakeTest, ReadMetadataHeaders) {
                     Contains(Pair("x-goog-hash", "crc32c=" + want_crc))));
 }
 
-/// @test Matrix row A2: `ReadRange`, `ReadFromOffset`, `ReadLast`, combined
+/// @test `ReadRange`, `ReadFromOffset`, `ReadLast`, combined
 /// `ReadRange`+`ReadFromOffset`, and invalid range bounds.
 TEST_F(AdapterFakeTest, ReadRanges) {
   fake_.objects["alpha"] = "0123456789abcdef";
@@ -590,7 +590,7 @@ TEST_F(AdapterFakeTest, ReadRanges) {
   EXPECT_EQ(fake_.read_requests.size(), requests_before);
 }
 
-/// @test Matrix row A3: reading past EOF surfaces `kOutOfRange`.
+/// @test reading past EOF surfaces `kOutOfRange`.
 TEST_F(AdapterFakeTest, ReadPastEof) {
   fake_.objects["short.bin"] = "abcd";
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -602,7 +602,7 @@ TEST_F(AdapterFakeTest, ReadPastEof) {
   EXPECT_THAT(s.status(), StatusIs(StatusCode::kOutOfRange));
 }
 
-/// @test Matrix row A3: reading a zero-byte object returns empty body and
+/// @test reading a zero-byte object returns empty body and
 /// preserves metadata.
 TEST_F(AdapterFakeTest, ZeroByteObject) {
   fake_.objects["empty.bin"] = "";
@@ -617,7 +617,7 @@ TEST_F(AdapterFakeTest, ZeroByteObject) {
   EXPECT_EQ(s.generation(), std::optional<std::int64_t>(77));
 }
 
-/// @test Matrix row A4: `Generation` and `IfGenerationMatch` presence on reads
+/// @test `Generation` and `IfGenerationMatch` presence on reads
 /// (unset leaves `has_if_generation_match()` false; `0` sets it explicitly).
 TEST_F(AdapterFakeTest, ReadPreconditions) {
   fake_.objects["p.bin"] = "xyz";
@@ -648,7 +648,7 @@ TEST_F(AdapterFakeTest, ReadPreconditions) {
   }
 }
 
-/// @test Matrix row A5: `Client::InsertObject` sends `known_size = size` over
+/// @test `Client::InsertObject` sends `known_size = size` over
 /// `WriteObject` with `JSON` transport.
 TEST_F(AdapterFakeTest, InsertObject) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -673,7 +673,7 @@ TEST_F(AdapterFakeTest, InsertObject) {
   EXPECT_EQ(fake_.objects["ins.bin"], body);
 }
 
-/// @test Matrix row A6: `Client::WriteObject` (< 8 MiB) leaves `known_size`
+/// @test `Client::WriteObject` (< 8 MiB) leaves `known_size`
 /// unset, forwards `UploadBufferSizeOption` in `chunk_size`, and finalizes on
 /// `Close()`.
 TEST_F(AdapterFakeTest, WriteSmall) {
@@ -695,7 +695,7 @@ TEST_F(AdapterFakeTest, WriteSmall) {
   EXPECT_EQ(fake_.objects["small.bin"], body);
 }
 
-/// @test Matrix row A7: multi-chunk `Client::WriteObject` streams across
+/// @test multi-chunk `Client::WriteObject` streams across
 /// `UploadBufferSizeOption` boundaries and reassembles cleanly.
 TEST_F(AdapterFakeTest, WriteLarge) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(
@@ -716,7 +716,7 @@ TEST_F(AdapterFakeTest, WriteLarge) {
   EXPECT_EQ(fake_.writes.front().front().header().chunk_size(), 256U * 1024);
 }
 
-/// @test Matrix row A7: non-final `UploadChunk` returns `committed_size = bytes
+/// @test non-final `UploadChunk` returns `committed_size = bytes
 /// accepted` with `payload == nullopt`; final `UploadChunk` returns metadata.
 TEST_F(AdapterFakeTest, CommittedSizeSemantics) {
   StatusOr<std::shared_ptr<gcs_internal::StorageConnection>> conn =
@@ -753,7 +753,7 @@ TEST_F(AdapterFakeTest, CommittedSizeSemantics) {
   EXPECT_EQ(r2->payload->size(), chunk1.size() + chunk2.size());
 }
 
-/// @test Matrix row A8: `UploadContentLength(n)` sets `WriteHeader.known_size`.
+/// @test `UploadContentLength(n)` sets `WriteHeader.known_size`.
 TEST_F(AdapterFakeTest, KnownSize) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
   ASSERT_THAT(client, IsOk());
@@ -770,7 +770,7 @@ TEST_F(AdapterFakeTest, KnownSize) {
   EXPECT_EQ(hdr.known_size(), static_cast<std::int64_t>(body.size()));
 }
 
-/// @test Matrix row A9: `IfGenerationMatch(0)` sets `if_generation_match = 0`
+/// @test `IfGenerationMatch(0)` sets `if_generation_match = 0`
 /// and fails with `kFailedPrecondition` when the object already exists.
 TEST_F(AdapterFakeTest, WritePrecondition) {
   fake_.objects["exists.bin"] = "v1";
@@ -789,7 +789,7 @@ TEST_F(AdapterFakeTest, WritePrecondition) {
   EXPECT_EQ(fake_.objects["exists.bin"], "v1");
 }
 
-/// @test Matrix row A10: resuming a prior upload session (`Restore...` /
+/// @test resuming a prior upload session (`Restore...` /
 /// `QueryResumableUpload`) returns `kUnimplemented`.
 TEST_F(AdapterFakeTest, ResumeUnsupported) {
   StatusOr<std::shared_ptr<gcs_internal::StorageConnection>> conn =
@@ -812,7 +812,7 @@ TEST_F(AdapterFakeTest, ResumeUnsupported) {
   EXPECT_THAT(stream.last_status(), StatusIs(StatusCode::kUnimplemented));
 }
 
-/// @test Matrix row A11: `ContentType` and `WithObjectMetadata` populate
+/// @test `ContentType` and `WithObjectMetadata` populate
 /// `WriteHeader.content_type`.
 TEST_F(AdapterFakeTest, ContentType) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -835,7 +835,7 @@ TEST_F(AdapterFakeTest, ContentType) {
   EXPECT_EQ(fake_.writes.back().front().header().content_type(), "text/csv");
 }
 
-/// @test Matrix row A12: an upload cancelled via `AutoFinalizeDisabled()` +
+/// @test an upload cancelled via `AutoFinalizeDisabled()` +
 /// `Client::DeleteResumableUpload` on a live `Client`, or via connection
 /// destruction after `Suspend()`, cancels the UDS stream and never commits an
 /// object.
@@ -880,7 +880,7 @@ TEST_F(AdapterFakeTest, AbandonedUpload) {
   EXPECT_EQ(fake_.objects.count("abandoned-2"), 0U);
 }
 
-/// @test Matrix row A13: `Client::ListObjects` iterates pages and forwards
+/// @test `Client::ListObjects` iterates pages and forwards
 /// filter options.
 TEST_F(AdapterFakeTest, ListObjectsPages) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -912,7 +912,7 @@ TEST_F(AdapterFakeTest, ListObjectsPages) {
   EXPECT_EQ(fake_.list_objects_requests[1].page_token(), "page-2");
 }
 
-/// @test Matrix row A13: `ListedObject` maps its subset of fields to
+/// @test `ListedObject` maps its subset of fields to
 /// `storage::ObjectMetadata`.
 TEST_F(AdapterFakeTest, ListObjectsFieldsSubset) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -935,7 +935,7 @@ TEST_F(AdapterFakeTest, ListObjectsFieldsSubset) {
             google::cloud::storage_internal::Crc32cFromProto(0xabcdef01));
 }
 
-/// @test Matrix row A14: `Client::ListBucketsForProject` and `ListBuckets`
+/// @test `Client::ListBucketsForProject` and `ListBuckets`
 /// iterate pages and map `BucketMetadata`.
 TEST_F(AdapterFakeTest, ListBucketsPages) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(
@@ -989,7 +989,7 @@ TEST_F(AdapterFakeTest, DeleteObject) {
               StatusIs(StatusCode::kNotFound));
 }
 
-/// @test Matrix row A15: unimplemented `StorageConnection` methods fail with
+/// @test unimplemented `StorageConnection` methods fail with
 /// `kUnimplemented` and name the method.
 TEST_F(AdapterFakeTest, UnimplementedMethods) {
   StatusOr<gcs::Client> client = MakeUdsStorageClient(CoreOpts());
@@ -1039,7 +1039,7 @@ TEST_F(AdapterFakeTest, UnimplementedMethods) {
   }
 }
 
-/// @test Matrix row A16: `AsyncClient::Open` returns an `ObjectDescriptor`
+/// @test `AsyncClient::Open` returns an `ObjectDescriptor`
 /// populated with `projects/_/buckets/<bucket>` v2 metadata.
 TEST_F(AdapterFakeTest, AsyncOpen) {
   fake_.objects["open.bin"] = "0123456789";
@@ -1060,7 +1060,7 @@ TEST_F(AdapterFakeTest, AsyncOpen) {
   EXPECT_EQ(fake_.open_requests[0].bucket(), "my-bucket");
 }
 
-/// @test Matrix row A17: 50 concurrent `ObjectDescriptor::Read` calls fan out
+/// @test 50 concurrent `ObjectDescriptor::Read` calls fan out
 /// over the 4 UDS channels and return exact ranges and offsets.
 TEST_F(AdapterFakeTest, AsyncConcurrentRanges) {
   // Spin up a server capped at 1 concurrent HTTP/2 stream per UDS connection,
@@ -1138,7 +1138,7 @@ TEST_F(AdapterFakeTest, AsyncConcurrentRanges) {
   (void)std::remove(capped_sock.c_str());
 }
 
-/// @test Matrix row A18: destroying `ObjectDescriptor` while a `ReadRange`
+/// @test destroying `ObjectDescriptor` while a `ReadRange`
 /// call is in flight sends `CloseObject` and resolves pending reads with
 /// `kCancelled`.
 TEST_F(AdapterFakeTest, AsyncCloseWithPendingReads) {
@@ -1173,7 +1173,7 @@ TEST_F(AdapterFakeTest, AsyncCloseWithPendingReads) {
   EXPECT_THAT(fake_.closed_handles, ElementsAre(1U));
 }
 
-/// @test Matrix row A19: `Open` passes through `kPermissionDenied` unchanged.
+/// @test `Open` passes through `kPermissionDenied` unchanged.
 TEST_F(AdapterFakeTest, AsyncOpenPermissionDenied) {
   fake_.error = grpc::Status(
       grpc::StatusCode::PERMISSION_DENIED,
@@ -1187,7 +1187,7 @@ TEST_F(AdapterFakeTest, AsyncOpenPermissionDenied) {
                                         "not yet available"));
 }
 
-/// @test Matrix row A20 + P3: `StartAppendableObjectUpload` streams data with
+/// @test `StartAppendableObjectUpload` streams data with
 /// `transport = GRPC` and finalizes to `google::storage::v2::Object`.
 TEST_F(AdapterFakeTest, AsyncAppendableWriteFinalize) {
   StatusOr<gcs::AsyncClient> client = MakeUdsAsyncClient(CoreOpts());
@@ -1229,7 +1229,7 @@ TEST_F(AdapterFakeTest, AsyncAppendableWriteFinalize) {
   EXPECT_EQ(fake_.objects.count("app.bin"), 0U);
 }
 
-/// @test Matrix row A21: `Flush` and `Query` report bytes accepted by the UDS
+/// @test `Flush` and `Query` report bytes accepted by the UDS
 /// server, and `Close()` without `Finalize()` returns `kUnimplemented`.
 TEST_F(AdapterFakeTest, AsyncFlushQuerySemantics) {
   StatusOr<std::shared_ptr<gcs::AsyncConnection>> conn =
@@ -1279,7 +1279,7 @@ TEST_F(AdapterFakeTest, AsyncFlushQuerySemantics) {
   ASSERT_THAT((*raw_writer)->Finalize(gcs::WritePayload("")).get(), IsOk());
 }
 
-/// @test Matrix row A22: when the server falls back to JSON on an appendable
+/// @test when the server falls back to JSON on an appendable
 /// upload (`transport_used = JSON`), `Finalize` logs a warning and records
 /// `x-uds-transport-used: JSON`.
 TEST_F(AdapterFakeTest, AsyncAppendableOnRegional) {
@@ -1305,7 +1305,7 @@ TEST_F(AdapterFakeTest, AsyncAppendableOnRegional) {
                             HasSubstr("JSON regular-object fallback"))));
 }
 
-/// @test Matrix row A23: regular-object BidiWrite and other non-UDS
+/// @test regular-object BidiWrite and other non-UDS
 /// `AsyncClient` operations return `kUnimplemented`.
 TEST_F(AdapterFakeTest, AsyncRegularBidiWriteUnimplemented) {
   StatusOr<gcs::AsyncClient> client = MakeUdsAsyncClient(CoreOpts());
@@ -1343,7 +1343,7 @@ TEST_F(AdapterFakeTest, AsyncRegularBidiWriteUnimplemented) {
               StatusIsWithMessage(StatusCode::kUnimplemented, "RewriteObject"));
 }
 
-/// @test Matrix row A24: `UnifiedCredentialsOption` and `GrpcCredentialOption`
+/// @test `UnifiedCredentialsOption` and `GrpcCredentialOption`
 /// are rejected at factory construction time.
 TEST_F(AdapterFakeTest, CredentialsRejected) {
   Options const unified =
@@ -1362,7 +1362,7 @@ TEST_F(AdapterFakeTest, CredentialsRejected) {
               StatusIs(StatusCode::kUnimplemented));
 }
 
-/// @test Matrix row A25: SDK retry/backoff policies log a warning and
+/// @test SDK retry/backoff policies log a warning and
 /// `MakeUdsStorageClient` installs no retry decorator.
 TEST_F(AdapterFakeTest, PoliciesIgnoredWarning) {
   ScopedLogCapture logs;
@@ -1382,7 +1382,7 @@ TEST_F(AdapterFakeTest, PoliciesIgnoredWarning) {
   EXPECT_THAT(logs.Messages(), SizeIs(Ge(2U)));
 }
 
-/// @test Matrix row A26: default checksum options disable redundant C++
+/// @test default checksum options disable redundant C++
 /// hashing, and both `ChecksumValidationOption` and deprecated per-request
 /// `DisableCrc32cChecksum` / `DisableMD5Hash` work.
 TEST_F(AdapterFakeTest, HashOptions) {
@@ -1429,7 +1429,7 @@ TEST_F(AdapterFakeTest, HashOptions) {
   ASSERT_THAT(ws.metadata(), IsOk());
 }
 
-/// @test Matrix row A27: 404 / 412 / 403 / 429 gRPC codes surface unchanged
+/// @test 404 / 412 / 403 / 429 gRPC codes surface unchanged
 /// through both `Client` and `AsyncClient`.
 TEST_F(AdapterFakeTest, ErrorCodes) {
   struct CodePair {
@@ -1462,7 +1462,7 @@ TEST_F(AdapterFakeTest, ErrorCodes) {
   }
 }
 
-/// @test Matrix row B9: a `SO_PEERCRED` `PERMISSION_DENIED` rejection on `Ping`
+/// @test a `SO_PEERCRED` `PERMISSION_DENIED` rejection on `Ping`
 /// fails fast with `kPermissionDenied` instead of waiting out
 /// `readiness_timeout` (`kDeadlineExceeded`).
 TEST_F(AdapterFakeTest, PeerCredentialPermissionDeniedFailsFast) {

@@ -24,10 +24,10 @@ Reads `<cell>-<mode>.summary.json`, `<cell>-<mode>.monitoring.json` (when
 present), and `<cell>-<mode>.path.json` for every cell in `RESULTS_DIR`, checks
 Cloudpath verification (`verified == True` and `0` DirectPath peers), and
 renders side-by-side comparison tables across `native`, `uds-sidecar`, and
-`uds-inproc` (plan rev 4 §7-§8).
+`uds-inproc`.
 
-`--doc-tables` renders one table per workload and bucket type in the layout of
-the consolidation worklog ("Benchmarking Results"): Native | uds-sidecar |
+`--doc-tables` renders one side-by-side table per workload and bucket type:
+Native | uds-sidecar |
 % Diff | uds-inproc | % Diff for latency (P50 / P90 / P99), throughput (MB/s
 for the bulk-data workloads, ops/s for the rate-bound ones), Cloud Monitoring
 CPU and peak memory. The latency basis is decided once per cell and named in
@@ -58,7 +58,7 @@ from typing import Any, Mapping, Sequence
 MODES = ("native", "uds-sidecar", "uds-inproc")
 UDS_MODES = ("uds-sidecar", "uds-inproc")
 
-# Worklog section titles, keyed by the workload prefix of the cell name.
+# Section titles, keyed by the workload prefix of the cell name.
 WORKLOAD_TITLES = (
     ("open", "W1 — Open a 200 MiB object (`AsyncClient::Open`)"),
     ("read50x2x4-serial",
@@ -451,10 +451,10 @@ def render_doc_tables(
     results_dir: str, cells: Mapping[str, Mapping[str, Mapping[str, Any]]],
     provenance: Sequence[str] = ()
 ) -> str:
-  """Renders the worklog "Benchmarking Results" tables for one results dir."""
+  """Renders the side-by-side per-workload tables for one results dir."""
   lines: list[str] = []
   lines.append(
-      f"# Worklog tables (`{os.path.basename(os.path.abspath(results_dir))}`)")
+      f"# Per-workload tables (`{os.path.basename(os.path.abspath(results_dir))}`)")
   lines.append("")
   if provenance:
     lines.extend(provenance)
@@ -561,7 +561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
   parser.add_argument("results_dir")
   modes = parser.add_mutually_exclusive_group()
   modes.add_argument("--doc-tables", action="store_true",
-                     help="render the worklog 'Benchmarking Results' layout")
+                     help="render side-by-side per-workload comparison tables")
   modes.add_argument("--sensitivity", metavar="BASE_DIR",
                      help="compare UDS comparators of RESULTS_DIR against "
                      "the same cells in BASE_DIR")

@@ -13,33 +13,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# VM job: runs S0 probes or the S4 benchmark matrix (plan rev 4 §6-§8) and
+# VM job: runs the probes or the benchmark matrix and
 # uploads every CSV, summary JSON, Cloud Monitoring JSON, path report, and log
 # to gs://$OPS/results/$RUN/.
 #
-#   PHASE=probes    S0 probes (quickstart on regional & zonal + Monitoring check)
+#   PHASE=probes    probes (quickstart on regional & zonal + Monitoring check)
 #   PHASE=smoke     short-duration smoke run of every workload x comparator
 #   PHASE=full      prescribed >=3 min / 5 min measured matrix (W1-W4 zonal,
 #                   plus regional when ALLOW_REGIONAL_BIDI=1; W5 zonal; W6)
 #   PHASE=regional  W1-W4 on the regional bucket only, for a bucket whose
-#                   project is allow-listed for BidiReadObject (row C2)
+#                   project has BidiReadObject enabled
 #   PHASE=wt        worker-thread sensitivity: W3 and W4 on zonal for the two
 #                   UDS comparators at WORKER_THREADS=N (N > 0)
 #
-# Enforces plan §7.1 comparison rules:
-#   * Ops Agent active before starting (row D3).
+# Comparison rules enforced:
+#   * Ops Agent active before starting.
 #   * One comparator running at a time; lingering daemons stopped between cells
 #     so idle server RSS never leaks into another comparator's VM memory window.
 #   * Rotating comparator order across workloads (`native`, `uds-sidecar`,
-#     `uds-inproc`, row C8).
-#   * `verify_path.py` gates every cell (Cloudpath only, row C1).
+#     `uds-inproc`).
+#   * `verify_path.py` gates every cell (Cloudpath only).
 #   * `monitoring.py` queries Cloud Monitoring CPU and Ops Agent memory per
-#     workload window (rows D1/D2).
+#     workload window.
 #   * Regional BidiReadObject is gated per bucket-owning project; any phase
 #     that reads bidi on the regional bucket first checks the gate and aborts
 #     with a clear message instead of producing 15 PERMISSION_DENIED cells.
 #     For `full` with ALLOW_REGIONAL_BIDI=1 the gate runs before the zonal
-#     cells, so a gate failure produces no cells at all (fix the allow list or
+#     cells, so a gate failure produces no cells at all (enable it or
 #     drop ALLOW_REGIONAL_BIDI, then rerun).
 #
 # Environment: OPS (results bucket/prefix), PHASE, REGIONAL, ZONAL,
@@ -125,7 +125,7 @@ upload() {
   gcloud storage cp --quiet "$@" "gs://$OPS/results/$RUN/" >/dev/null 2>&1 || true
 }
 
-# Row D3: verify Google Cloud Ops Agent is active before measuring.
+# Verify Google Cloud Ops Agent is active before measuring.
 if ! systemctl is-active --quiet google-cloud-ops-agent; then
   fatal "google-cloud-ops-agent is not active"
 fi
@@ -161,7 +161,7 @@ stop_daemon() {
 
 # Aborts unless the service admits BidiReadObject on the regional bucket. The
 # quickstart prints a "GAP  BidiReadObject" line when the bucket-owning project
-# is not on the allow list and still exits 0, so the marker is what decides;
+# does not have it enabled and still exits 0, so the marker is what decides;
 # a non-zero exit means the gate itself could not run (credentials, bucket,
 # network) and is reported as such. Either way `run-info.txt` records the
 # outcome before the run stops.
@@ -260,7 +260,7 @@ run_cell() {
 # (native has no Tokio pool) and the two workloads of the sensitivity check,
 # and goes through the same loop as the matrix so its flags cannot drift from
 # the base cells that `analyze.py --sensitivity` compares against. The
-# comparator order still rotates per workload (row C8).
+# comparator order still rotates per workload.
 COMPS=(native uds-sidecar uds-inproc)
 SHORT_WORKLOADS=(open read50x2x4-serial read50x2x4-concurrent random8k)
 BIDI_TARGETS=()
