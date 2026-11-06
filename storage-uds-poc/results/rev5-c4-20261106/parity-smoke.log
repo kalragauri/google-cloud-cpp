@@ -1,0 +1,8 @@
+CPP_SHA=c7e65b2b6a423541767cf3d55d444bb0a97f9788 RUST_SHA=e432ad1de767f8b8094de70fcb3113ccba67310d
+SMOKE w2a-native rc=0 ok=7 err=0 measured_opens=0 partial_bytes=0 wall=30.7 p50_ms=4372.1 range_p50_ms=0.0 mb_s=23.9
+SMOKE w2a-inproc rc=0 ok=7 err=0 measured_opens=0 partial_bytes=0 wall=31.3 p50_ms=4472.2 range_p50_ms=0.0 mb_s=23.4
+SMOKE w2b-sidecar rc=0 ok=10 err=0 measured_opens=0 partial_bytes=0 wall=33.3 p50_ms=3322.9 range_p50_ms=0.0 mb_s=31.5
+SMOKE w2a-native-nowarm rc=0 ok=3 err=0 measured_opens=1 partial_bytes=0 wall=15.8 p50_ms=4675.2 range_p50_ms=0.0 mb_s=19.9
+SMOKE w4-native rc=0 ok=277 err=0 measured_opens=0 partial_bytes=5687476224 wall=60.5 p50_ms=10369.1 range_p50_ms=804.8 mb_s=1053.6
+SMOKE w4-inproc rc=0 ok=238 err=0 measured_opens=0 partial_bytes=4009754624 wall=60.8 p50_ms=8664.8 range_p50_ms=730.2 mb_s=887.1
+SMOKE w4-native-maxops rc=0 ok=2 err=0 measured_opens=1 partial_bytes=0 wall=16.2 p50_ms=6995.8 range_p50_ms=552.5 mb_s=25.9

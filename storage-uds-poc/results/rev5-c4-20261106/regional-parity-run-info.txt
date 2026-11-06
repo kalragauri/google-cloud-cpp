@@ -1,0 +1,6 @@
+host=kalragauri-uds-poc-c4 project=kalragauri-sdk-test instance_id=2425645790610435742 zone=us-central1-b machine=c4-standard-192 cpus=192
+phase=regional regional=kalragauri-uds-poc-vp-usw1 zonal= bucket_prefix= worker_threads=0 monitoring_flush_secs=240 workloads=read50x2x4-serial,read50x2x4-concurrent,bidi-read-48t start=2026-11-06T07:28:29Z
+ops_agent=active
+cpp_sha=c7e65b2b6a423541767cf3d55d444bb0a97f9788 rust_sha=e432ad1de767f8b8094de70fcb3113ccba67310d
+kernel=7.0.0-1014-gcp glibc=2.39
+end=2026-11-06T08:08:11Z failed_runs=0
