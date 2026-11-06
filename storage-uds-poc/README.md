@@ -87,7 +87,16 @@ Optional: `WORKER_THREADS` (default `0` = one Tokio worker per vCPU),
 `MONITORING_FLUSH_SECS` (default `240`, the wait after the last cell before the
 first Cloud Monitoring query; `monitoring.py` keeps retrying a window that is
 still missing 60 s buckets and marks a partial result with `expected_points`),
+`WORKLOADS` (comma-separated subset of the 8 workload names; the other cells of
+the phase are skipped and the comparator rotation is unchanged),
 `RUN` (results directory name), `POC` (checkout path).
+
+`read50x2x4-*` and `bidi-read-48t` open one `ObjectDescriptor` per worker
+thread outside the timed operation (normally during warm-up) and reuse it, so
+their latency covers the reads only; `measured_opens` in `*.summary.json`
+counts any open that still happened inside the measured window. W4 checks the
+deadline before every range; bytes of an object cut short by the deadline count
+toward throughput (`partial_bytes`) but not as an operation or latency sample.
 
 Regional `BidiReadObject` is admitted per bucket-owning project (preview
 allow list). `regional`, and `full` with

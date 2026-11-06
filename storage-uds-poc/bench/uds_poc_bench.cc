@@ -20,11 +20,13 @@
 // Cloudpath workloads (W1-W6):
 //   * W1 `open`: `AsyncClient::Open` on a pre-staged 200 MiB object (>=3 min)
 //   * W2 `read50x2x4-serial` / `read50x2x4-concurrent`: 50 x 2 MiB ranges at a
-//     4 MiB stride on a pre-staged 200 MiB object (>=3 min)
+//     4 MiB stride on a pre-staged 200 MiB object; each worker keeps one
+//     descriptor open, so the latency covers the 50 reads only (>=3 min)
 //   * W3 `random8k`: random 8 KiB ranges on an already-open 100 MiB object
 //     (>=3 min)
-//   * W4 `bidi-read-48t`: 48 threads reading a pre-staged 200 MiB object in
-//     16 MiB `ObjectDescriptor::Read` ranges (5 min)
+//   * W4 `bidi-read-48t`: 48 threads, each streaming a pre-staged 200 MiB
+//     object in 16 MiB `ObjectDescriptor::Read` ranges through its own
+//     long-lived descriptor, checking the deadline per range (5 min)
 //   * W5 `bidi-write-48t`: 48 threads writing and finalizing 200 MB appendable
 //     objects via `StartAppendableObjectUpload` (5 min)
 //   * W6 `list-objects-100` / `list-buckets-100`: 100-item `ListObjects` and
@@ -169,6 +171,20 @@ std::string FormatUtcIso8601(SystemClock::time_point tp) {
 std::string FormatStatus(gc::Status const& s) {
   if (s.ok()) return {};
   return absl::StrCat(gc::StatusCodeToString(s.code()), ": ", s.message());
+}
+
+/// CSV `op` value for the workloads that read through a reused descriptor.
+std::string ReadOpName(WorkloadKind workload) {
+  switch (workload) {
+    case WorkloadKind::kRead50x2x4Serial:
+      return "READ50X2X4_SERIAL";
+    case WorkloadKind::kRead50x2x4Concurrent:
+      return "READ50X2X4_CONCURRENT";
+    case WorkloadKind::kBidiRead48t:
+      return "BIDI_READ_OBJECT";
+    default:
+      return "READ";
+  }
 }
 
 std::string JsonEscape(std::string_view input) {
@@ -322,6 +338,21 @@ class Recorder {
     range_latencies_us_.push_back(latency_us);
   }
 
+  /// Records the bytes of a W4 object cut short by the deadline. They count
+  /// toward throughput (they were transferred inside the window) but the
+  /// truncated object is neither an operation nor a latency sample.
+  void RecordPartialObject(SampleRow row) {
+    std::scoped_lock lk(mu_);
+    total_bytes_ += row.bytes;
+    partial_bytes_ += row.bytes;
+    rows_.push_back(std::move(row));
+  }
+
+  std::int64_t partial_bytes() const {
+    std::scoped_lock lk(mu_);
+    return partial_bytes_;
+  }
+
   std::int64_t total_ops() const {
     std::scoped_lock lk(mu_);
     return ops_ok_ + ops_err_;
@@ -379,6 +410,7 @@ class Recorder {
   std::int64_t ops_ok_ = 0;
   std::int64_t ops_err_ = 0;
   std::int64_t total_bytes_ = 0;
+  std::int64_t partial_bytes_ = 0;
   std::string first_error_;
   std::vector<double> latencies_us_;
   std::vector<double> range_latencies_us_;
@@ -656,7 +688,7 @@ void WriteSummaryJson(std::ostream& out, Config const& cfg,
                       std::optional<gcs_core::SidecarStats> const& srv_end,
                       std::optional<std::uint64_t> core_inproc_cpu_start_us,
                       std::optional<std::uint64_t> core_inproc_cpu_end_us,
-                      int server_pid) {
+                      int server_pid, int measured_opens) {
   LatencySummary const obj_lat = rec.ObjectSummary();
   LatencySummary const rng_lat = rec.RangeSummary();
   std::int64_t const bytes = rec.total_bytes();
@@ -699,6 +731,8 @@ void WriteSummaryJson(std::ostream& out, Config const& cfg,
       << "  \"ops_err\": " << rec.ops_err() << ",\n"
       << R"(  "first_error": ")" << JsonEscape(rec.first_error()) << "\",\n"
       << "  \"total_bytes\": " << bytes << ",\n"
+      << "  \"partial_bytes\": " << rec.partial_bytes() << ",\n"
+      << "  \"measured_opens\": " << measured_opens << ",\n"
       << "  \"throughput_mb_s\": " << mb_s << ",\n"
       << "  \"throughput_mib_s\": " << mib_s << ",\n"
       << "  \"latency_us\": {\n"
@@ -1082,6 +1116,20 @@ int main(int argc, char* argv[]) {
     }
   }
 
+  // W2 and W4 time the reads, not the stream setup: the Rapid SLI defines
+  // Read50x2x4 latency as "the total time needed to complete all 50 reads",
+  // and the Go and Java POC harnesses open the session outside the timer. Each
+  // worker therefore opens its descriptor once (normally during warm-up),
+  // untimed, and keeps it until a read fails. `measured_opens` counts the opens
+  // that still happen inside the measured window so the summary shows it.
+  bool const reuses_descriptor =
+      cfg.workload == WorkloadKind::kRead50x2x4Serial ||
+      cfg.workload == WorkloadKind::kRead50x2x4Concurrent ||
+      cfg.workload == WorkloadKind::kBidiRead48t;
+  std::vector<std::optional<gcs::ObjectDescriptor>> descriptors(
+      static_cast<std::size_t>(cfg.threads));
+  std::atomic<int> measured_opens{0};
+
   auto run_phase = [&](double phase_secs, bool record, Recorder* rec) {
     if (phase_secs <= 0.0) return;
     SteadyClock::time_point const deadline =
@@ -1097,9 +1145,41 @@ int main(int argc, char* argv[]) {
         if (record && cfg.max_ops > 0 && seq >= cfg.max_ops) break;
         if (!record && cfg.max_ops > 0 && seq >= 1) break;
 
+        std::optional<gcs::ObjectDescriptor>& descriptor =
+            descriptors[static_cast<std::size_t>(tid)];
+        if (reuses_descriptor && !descriptor.has_value()) {
+          SystemClock::time_point const open_wall = SystemClock::now();
+          SteadyClock::time_point const open_t0 = SteadyClock::now();
+          gc::StatusOr<gcs::ObjectDescriptor> opened =
+              clients.async_client
+                  ->Open(gcs::BucketName(cfg.bucket), staged_object)
+                  .get();
+          if (!opened) {
+            // A failed open is the operation's outcome: record it as an error
+            // row so the cell cannot report success on a missing object.
+            if (record && rec != nullptr) {
+              SampleRow row;
+              row.ts_utc = FormatUtcIso8601(open_wall);
+              row.thread_id = tid;
+              row.seq = seq;
+              row.op = ReadOpName(cfg.workload);
+              row.latency_us = std::chrono::duration<double, std::micro>(
+                                   SteadyClock::now() - open_t0)
+                                   .count();
+              row.ok = false;
+              row.error = FormatStatus(opened.status());
+              rec->RecordSample(std::move(row));
+            }
+            continue;
+          }
+          descriptor.emplace(*std::move(opened));
+          if (record) measured_opens.fetch_add(1, std::memory_order_relaxed);
+        }
+
         SystemClock::time_point const ts_wall = SystemClock::now();
         SteadyClock::time_point const t0 = SteadyClock::now();
         std::int64_t op_bytes = 0;
+        bool partial_object = false;
         std::string op_name;
         gc::Status status;
 
@@ -1120,18 +1200,10 @@ int main(int argc, char* argv[]) {
             break;
           }
           case WorkloadKind::kRead50x2x4Serial: {
-            op_name = "READ50X2X4_SERIAL";
-            gc::StatusOr<gcs::ObjectDescriptor> d =
-                clients.async_client
-                    ->Open(gcs::BucketName(cfg.bucket), staged_object)
-                    .get();
-            if (!d) {
-              status = std::move(d).status();
-              break;
-            }
+            op_name = ReadOpName(cfg.workload);
             for (int r = 0; r < 50; ++r) {
               std::int64_t const off = static_cast<std::int64_t>(r) * 4 * kMiB;
-              auto [reader, token] = d->Read(off, cfg.range_size);
+              auto [reader, token] = descriptor->Read(off, cfg.range_size);
               std::int64_t got = 0;
               status =
                   DrainAsyncReader(std::move(reader), std::move(token), &got);
@@ -1146,15 +1218,7 @@ int main(int argc, char* argv[]) {
             break;
           }
           case WorkloadKind::kRead50x2x4Concurrent: {
-            op_name = "READ50X2X4_CONCURRENT";
-            gc::StatusOr<gcs::ObjectDescriptor> d =
-                clients.async_client
-                    ->Open(gcs::BucketName(cfg.bucket), staged_object)
-                    .get();
-            if (!d) {
-              status = std::move(d).status();
-              break;
-            }
+            op_name = ReadOpName(cfg.workload);
             struct BatchState {
               std::mutex mu;
               std::condition_variable cv;
@@ -1165,7 +1229,7 @@ int main(int argc, char* argv[]) {
             auto bytes_acc = std::make_shared<std::atomic<std::int64_t>>(0);
             for (int r = 0; r < 50; ++r) {
               std::int64_t const off = static_cast<std::int64_t>(r) * 4 * kMiB;
-              auto [reader, token] = d->Read(off, cfg.range_size);
+              auto [reader, token] = descriptor->Read(off, cfg.range_size);
               DrainAsyncReaderCallback(std::move(reader), std::move(token),
                                        bytes_acc, [batch](gc::Status s) {
                                          std::scoped_lock lk(batch->mu);
@@ -1212,21 +1276,17 @@ int main(int argc, char* argv[]) {
             break;
           }
           case WorkloadKind::kBidiRead48t: {
-            op_name = "BIDI_READ_OBJECT";
-            gc::StatusOr<gcs::ObjectDescriptor> d =
-                clients.async_client
-                    ->Open(gcs::BucketName(cfg.bucket), staged_object)
-                    .get();
-            if (!d) {
-              status = std::move(d).status();
-              break;
-            }
-            for (std::int64_t off = 0; off < cfg.object_size;
+            op_name = ReadOpName(cfg.workload);
+            // The deadline is checked before every range, not only between
+            // objects, so at most one in-flight range per worker runs past the
+            // end of the window instead of the rest of a 200 MiB object.
+            std::int64_t off = 0;
+            for (; off < cfg.object_size && SteadyClock::now() < deadline;
                  off += cfg.range_size) {
               std::int64_t const len =
                   std::min<std::int64_t>(cfg.range_size, cfg.object_size - off);
               SteadyClock::time_point const tr0 = SteadyClock::now();
-              auto [reader, token] = d->Read(off, len);
+              auto [reader, token] = descriptor->Read(off, len);
               std::int64_t got = 0;
               status =
                   DrainAsyncReader(std::move(reader), std::move(token), &got);
@@ -1244,6 +1304,7 @@ int main(int argc, char* argv[]) {
                         .count());
               }
             }
+            partial_object = status.ok() && off < cfg.object_size;
             break;
           }
           case WorkloadKind::kBidiWrite48t: {
@@ -1305,6 +1366,7 @@ int main(int argc, char* argv[]) {
         }
 
         SteadyClock::time_point const t1 = SteadyClock::now();
+        if (!status.ok() && reuses_descriptor) descriptor.reset();
         if (record && rec != nullptr) {
           SampleRow row;
           row.ts_utc = FormatUtcIso8601(ts_wall);
@@ -1316,7 +1378,12 @@ int main(int argc, char* argv[]) {
               std::chrono::duration<double, std::micro>(t1 - t0).count();
           row.ok = status.ok();
           row.error = FormatStatus(status);
-          rec->RecordSample(std::move(row));
+          if (partial_object) {
+            row.op += "_PARTIAL";
+            if (row.bytes > 0) rec->RecordPartialObject(std::move(row));
+          } else {
+            rec->RecordSample(std::move(row));
+          }
         }
       }
     };
@@ -1366,6 +1433,7 @@ int main(int argc, char* argv[]) {
     if (st) srv_end = *st;
   }
   w3_descriptor.reset();
+  descriptors.clear();
 
   // --- Post-window cleanup (outside timed window and Stats snapshot) ---------
   if (!created_objects.empty()) {
@@ -1386,7 +1454,8 @@ int main(int argc, char* argv[]) {
   std::ostringstream json_buf;
   WriteSummaryJson(json_buf, cfg, win_start_utc, win_end_utc, wall_secs,
                    recorder, app_start, app_end, srv_start, srv_end,
-                   inproc_cpu_start_us, inproc_cpu_end_us, server_pid);
+                   inproc_cpu_start_us, inproc_cpu_end_us, server_pid,
+                   measured_opens.load());
   if (!cfg.summary_json.empty()) {
     std::ofstream jf(cfg.summary_json);
     if (!jf.is_open()) {
